@@ -12,6 +12,7 @@
 //! 3. Recovery worker (background object migration)
 //! 4. Optional HTTP/S3 server
 //! 5. Optional NFS server
+//! 6. Optional NBD export server (for QEMU/qemu-img)
 
 mod cluster;
 mod config;
@@ -21,6 +22,7 @@ mod group;
 mod http;
 mod journal;
 mod migrate;
+mod nbd;
 mod nfs;
 mod object_cache;
 mod object_list_cache;
@@ -115,6 +117,14 @@ struct Args {
     /// NFS MOUNT port (default: 2050)
     #[arg(long, default_value_t = 2050)]
     nfs_mount_port: u16,
+
+    /// Enable NBD export server
+    #[arg(long)]
+    nbd: bool,
+
+    /// NBD server port (default: 10809)
+    #[arg(long, default_value_t = nbd::NBD_DEFAULT_PORT)]
+    nbd_port: u16,
 
     /// Cluster driver to use: "local" (single-node) or "sdcluster" (P2P TCP mesh)
     #[arg(long, default_value = "local")]
@@ -310,6 +320,17 @@ async fn main() {
         tokio::spawn(async move {
             if let Err(e) = nfs::start_nfs_server(sys_nfs, nfs_config).await {
                 error!("NFS server failed: {}", e);
+            }
+        });
+    }
+
+    // Spawn NBD export server
+    if args.nbd {
+        let sys_nbd = sys.clone();
+        let nbd_port = args.nbd_port;
+        tokio::spawn(async move {
+            if let Err(e) = nbd::start_nbd_server(sys_nbd, nbd_port).await {
+                error!("NBD server failed: {}", e);
             }
         });
     }

@@ -33,6 +33,10 @@ pub enum SharedLockState {
 pub struct VdiState {
     /// VDI id
     pub vid: u32,
+    /// Virtual disk size in bytes
+    pub vdi_size: u64,
+    /// VDI name
+    pub name: String,
     /// Number of replicas
     pub nr_copies: u8,
     /// Whether this is a snapshot
@@ -51,6 +55,8 @@ impl VdiState {
     pub fn new(vid: u32, nr_copies: u8, copy_policy: u8) -> Self {
         Self {
             vid,
+            vdi_size: 0,
+            name: String::new(),
             nr_copies,
             snapshot: false,
             copy_policy,

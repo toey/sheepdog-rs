@@ -7,7 +7,7 @@
 use sheepdog_proto::error::{SdError, SdResult};
 use sheepdog_proto::node::ClusterStatus;
 use sheepdog_proto::request::{ResponseResult, SdRequest};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::daemon::SharedSys;
 use crate::request::Request;
@@ -165,6 +165,8 @@ async fn new_vdi(
     // Create VDI state entry
     let vdi_state = sheepdog_proto::vdi::VdiState {
         vid,
+        vdi_size,
+        name: name.to_string(),
         nr_copies: copies,
         snapshot: false,
         copy_policy,
@@ -173,6 +175,15 @@ async fn new_vdi(
         participants: Vec::new(),
     };
     s.vdi_state.insert(vid, vdi_state);
+
+    // Release write lock before I/O
+    drop(s);
+
+    // Write the VDI inode object to the store
+    let inode = crate::vdi::create_inode(name, vdi_size, vid, copies, copy_policy, 1);
+    if let Err(e) = crate::vdi::write_inode(&sys, &inode).await {
+        warn!("failed to write inode for VDI {:#x}: {}", vid, e);
+    }
 
     info!(
         "created VDI: name={}, vid={:#x}, size={}, copies={}",
@@ -379,6 +390,8 @@ async fn notify_vdi_add(
 
     let vdi_state = sheepdog_proto::vdi::VdiState {
         vid: new_vid,
+        vdi_size: 0, // Size not provided in notification
+        name: String::new(),
         nr_copies: copies,
         snapshot: false,
         copy_policy,
