@@ -2,7 +2,7 @@
 
 A **Rust** rewrite of [Sheepdog](https://sheepdog.github.io/sheepdog/) — distributed block storage for QEMU/KVM virtual machines.
 
-> 17,500+ lines of async Rust across 7 crates. No external cluster dependencies.
+> 18,000+ lines of async Rust across 7 crates. No external cluster dependencies.
 > Connects to QEMU via NBD — works with QEMU 6.0+ (which removed native sheepdog support).
 > Optional DPDK data plane for kernel-bypass peer I/O.
 
@@ -119,56 +119,69 @@ scripts/cluster.sh stop
 scripts/cluster.sh clean
 ```
 
-Options: `--nbd`, `--nfs`, `--format`, `--copies N`, `--http`.
+Options: `--nbd`, `--nfs`, `--format`, `--copies N`.
 
-### 6. Recovery test
+---
 
-A test script validates node failure, recovery, and rebalance:
+## Test Suites
 
-```bash
-# Run full recovery test (automatic cleanup)
-scripts/test-recovery.sh
+Three test scripts validate the system end-to-end using real sheep daemons and qemu-io:
 
-# Keep data for inspection
-scripts/test-recovery.sh --keep
-```
+### I/O Correctness (`test-io.sh`)
 
-**Test flow:**
-
-| Phase | What happens |
-|-------|-------------|
-| 1. Setup | Start 3-node cluster, write data via NBD |
-| 2. Kill | SIGKILL node 2 (crash simulation) |
-| 3. Recovery | Cluster detects failure (~15s), data still readable (2-copy) |
-| 4. Add node | New node 3 joins, epoch bumps |
-| 5. Rebalance | Verify data integrity after rebalance |
-
-### 7. I/O correctness test (no cache)
-
-Tests data integrity through the NBD path with object cache **disabled** — every I/O goes directly through the store layer:
+Tests data integrity through the NBD path with object cache **disabled**:
 
 ```bash
-# Run full I/O test suite
-scripts/test-io.sh
-
-# Keep data for inspection
-scripts/test-io.sh --keep
-
-# Skip the Direct I/O phase
+scripts/test-io.sh                # Run full suite (63 tests)
+scripts/test-io.sh --keep         # Keep data for inspection
 scripts/test-io.sh --skip-directio
 ```
-
-**Test phases:**
 
 | Phase | What happens |
 |-------|-------------|
 | 1. Setup | 3-node cluster, no `--cache`, create VDI |
 | 2. Basic I/O | Sequential write + read (4K, 64K, 256K, 1M) at each object offset |
-| 3. Overwrite | Rewrite same locations with new patterns, partial overwrites |
+| 3. Overwrite | Rewrite same locations, partial overwrites |
 | 4. Cross-boundary | Writes spanning two 4MB objects (8K and 1M) |
-| 5. Large I/O | Multi-object sequential writes (8MB, 16MB, 32MB full VDI) |
-| 6. Sparse | Non-contiguous offsets, verify gaps read as zeros |
+| 5. Large I/O | Multi-object sequential writes (8MB, 16MB, 32MB) |
+| 6. Sparse | Non-contiguous offsets, gaps read as zeros |
 | 7. Direct I/O | Restart with `--directio`, repeat key tests |
+
+### Erasure Coding (`test-ec.sh`)
+
+Tests Reed-Solomon EC correctness through the NBD path:
+
+```bash
+scripts/test-ec.sh                # Run full suite (44 tests)
+scripts/test-ec.sh --keep
+```
+
+| Phase | What happens |
+|-------|-------------|
+| 1. Setup | 3-node cluster, create EC 2:1 VDI |
+| 2. Basic EC I/O | Write + read patterns at each object offset |
+| 3. EC Overwrite | Partial writes (read-modify-write cycle) |
+| 4. Cross-boundary | EC writes spanning two 4MB objects |
+| 5. Large EC I/O | Multi-object 8MB/16MB sequential EC writes |
+| 6. Strip verification | Check EC strip files on disk (count, size) |
+| 7. Degraded | Write/read with 1 node down, restart |
+
+### Recovery & Rebalance (`test-recovery.sh`)
+
+Tests node failure detection, recovery, and data rebalancing:
+
+```bash
+scripts/test-recovery.sh          # Run full suite (21 tests)
+scripts/test-recovery.sh --keep
+```
+
+| Phase | What happens |
+|-------|-------------|
+| 1. Setup | Start 3-node cluster, write data via NBD |
+| 2. Kill | SIGKILL node 2 (crash simulation) |
+| 3. Recovery | Cluster detects failure (~15s), data still readable |
+| 4. Add node | New node 3 joins, epoch bumps |
+| 5. Rebalance | Verify data integrity after rebalance |
 
 ---
 
@@ -179,10 +192,10 @@ Sheepdog-rs supports **Reed-Solomon erasure coding** as an alternative to simple
 ### Create an EC VDI
 
 ```bash
-# Erasure coded 2+1 (2 data strips + 1 parity strip, needs ≥3 nodes)
+# Erasure coded 2+1 (2 data strips + 1 parity strip, needs 3+ nodes)
 dog vdi create myvdi 20G --copy-policy 2:1
 
-# Erasure coded 4+2 (4 data + 2 parity, needs ≥6 nodes)
+# Erasure coded 4+2 (4 data + 2 parity, needs 6+ nodes)
 dog vdi create myvdi 100G --copy-policy 4:2
 
 # Standard replication (default)
@@ -193,28 +206,28 @@ dog vdi create myvdi 20G --copies 3
 
 ```
   4 MB Object
-  ┌──────────────────┐
-  │     data         │
-  └──────┬───────────┘
-         │ split into D strips
-         ▼
-  ┌──────┬──────┐
-  │ D₁   │ D₂   │  (data strips)
-  └──┬───┴──┬───┘
-     │ Reed-Solomon encode
-     ▼
-  ┌──────┬──────┬──────┐
-  │ D₁   │ D₂   │ P₁   │  (D + P strips)
-  └──┬───┴──┬───┴──┬───┘
-     │      │      │
-  node-A  node-B  node-C
+  +--------------------+
+  |       data         |
+  +--------+-----------+
+           | split into D strips
+           v
+  +--------+--------+
+  |   D1   |   D2   |  (data strips)
+  +----+---+----+---+
+       | Reed-Solomon encode
+       v
+  +--------+--------+--------+
+  |   D1   |   D2   |   P1   |  (D + P strips)
+  +----+---+----+---+----+---+
+       |        |        |
+    node-A   node-B   node-C
 ```
 
-**Write path**: Object → split into D strips → RS encode to D+P strips → distribute to D+P nodes via hash ring.
+**Write path**: Object -> split into D strips -> RS encode to D+P strips -> distribute to D+P nodes via hash ring.
 
-**Read path**: Read D strips from nodes → if any are missing, fetch parity → RS reconstruct → reassemble.
+**Read path**: Read D strips from nodes -> if any are missing, fetch parity -> RS reconstruct -> reassemble.
 
-**Partial write**: Read full object (reconstruct from strips) → apply update at offset → re-encode → redistribute all strips.
+**Partial write**: Read full object (reconstruct from strips) -> apply update at offset -> re-encode -> redistribute all strips.
 
 ### Policy byte format
 
@@ -222,12 +235,11 @@ The copy policy is encoded as a single byte: `(D << 4) | P`.
 
 | Policy | D:P | Total strips | Storage overhead |
 |--------|-----|:------------:|:----------------:|
-| `0x21` | 2:1 | 3 | 1.5× |
-| `0x41` | 4:1 | 5 | 1.25× |
-| `0x42` | 4:2 | 6 | 1.5× |
-| `0x12` | 1:2 | 3 | 3× |
+| `0x21` | 2:1 | 3 | 1.5x |
+| `0x41` | 4:1 | 5 | 1.25x |
+| `0x42` | 4:2 | 6 | 1.5x |
 
-Compare with replication: 3-copy replication = 3× overhead. EC 4:2 gives the same fault tolerance with only 1.5× overhead.
+Compare with replication: 3-copy = 3x overhead. EC 4:2 gives the same fault tolerance with only 1.5x overhead.
 
 ---
 
@@ -241,10 +253,10 @@ The control plane (cluster mesh, dog CLI, HTTP, NFS, NBD) stays on kernel TCP. O
 
 ```
   Control plane (TCP, kernel)          Data plane (UDP, DPDK)
-  ────────────────────────────         ──────────────────────────
-  Client → sheep:7000 (gateway)        sheep ←→ sheep via :7100
-  dog → sheep:7000 (CLI)               rte_eth_rx/tx_burst()
-  sheep ←→ sheep:7001 (cluster mesh)   Poll-mode driver (PMD)
+  ----------------------------         --------------------------
+  Client -> sheep:7000 (gateway)       sheep <-> sheep via :7100
+  dog -> sheep:7000 (CLI)              rte_eth_rx/tx_burst()
+  sheep <-> sheep:7001 (cluster mesh)  Poll-mode driver (PMD)
   NBD :10809, NFS :2049, HTTP :8000    Dedicated CPU core
 ```
 
@@ -254,7 +266,7 @@ The control plane (cluster mesh, dog CLI, HTTP, NFS, NBD) stays on kernel TCP. O
 # Requires DPDK installed (pkg-config --libs libdpdk must work)
 cargo build -p sheep --features dpdk
 
-# Without DPDK (default) — pure TCP, no system deps
+# Without DPDK (default) -- pure TCP, no system deps
 cargo build -p sheep
 ```
 
@@ -276,11 +288,11 @@ Each node advertises its DPDK address (`io_addr` + `io_port`) so peers route dat
 
 ```
   Ethernet | IP | UDP | DpdkPeerHeader (16 bytes) | Payload
-                        ├── request_id   (u64)
-                        ├── flags        (u16)  FIRST/LAST/RESPONSE/SINGLE
-                        ├── frag_index   (u16)
-                        ├── total_frags  (u16)
-                        └── payload_len  (u16)
+                        +-- request_id   (u64)
+                        +-- flags        (u16)  FIRST/LAST/RESPONSE/SINGLE
+                        +-- frag_index   (u16)
+                        +-- total_frags  (u16)
+                        +-- payload_len  (u16)
 ```
 
 Large messages (e.g., 4 MB objects) are fragmented into ~8 KB UDP datagrams and reassembled by the receiver.
@@ -302,88 +314,94 @@ Large messages (e.g., 4 MB objects) are fragmented into ~8 KB UDP datagrams and 
 
 ```
 sheepdog-rs/
-├── crates/
-│   ├── sheepdog-proto/   1,462 LOC   Wire protocol, types, constants
-│   ├── sheepdog-core/      650 LOC   Consistent hashing, EC, transport traits
-│   ├── sheep/           11,500 LOC   Storage daemon
-│   ├── dog/              2,728 LOC   CLI admin tool
-│   ├── shepherd/           344 LOC   Cluster monitor
-│   ├── sheepdog-dpdk/      560 LOC   DPDK data plane (optional)
-│   └── sheepfs/            554 LOC   FUSE filesystem (optional)
-├── scripts/
-│   ├── cluster.sh          353 LOC   3-node cluster management
-│   ├── test-recovery.sh    310 LOC   Recovery & rebalance test
-│   └── test-io.sh          350 LOC   I/O correctness test (no cache)
-└── Cargo.toml                        Workspace root (v0.10.0)
++-- crates/
+|   +-- sheepdog-proto/   1,568 LOC   Wire protocol, types, constants
+|   +-- sheepdog-core/      755 LOC   Consistent hashing, EC, transport traits
+|   +-- sheep/           11,402 LOC   Storage daemon
+|   +-- dog/              2,728 LOC   CLI admin tool
+|   +-- shepherd/           349 LOC   Cluster monitor
+|   +-- sheepdog-dpdk/      766 LOC   DPDK data plane (optional)
+|   +-- sheepfs/            554 LOC   FUSE filesystem (optional)
++-- scripts/
+|   +-- defaults.sh          23 LOC   Shared defaults (ports, paths)
+|   +-- cluster.sh          348 LOC   3-node cluster management
+|   +-- test-io.sh          580 LOC   I/O correctness test (63 tests)
+|   +-- test-ec.sh          575 LOC   EC correctness test (44 tests)
+|   +-- test-recovery.sh    475 LOC   Recovery & rebalance test (21 tests)
++-- Cargo.toml                        Workspace root (v0.10.0)
 ```
 
-### sheepdog-proto — Protocol Library
+**Total**: 18,122 LOC Rust + 2,001 LOC bash | 75 unit tests + 128 integration tests
+
+### sheepdog-proto -- Protocol Library
 
 Wire types shared by all components:
 
-- `SdRequest` / `ResponseResult` — 30+ request variants (read, write, VDI ops, cluster ops)
-- `ObjectId` — 64-bit OID encoding (8-bit flags + 24-bit VDI ID + 32-bit object index)
-- `SdNode` / `NodeId` — Node identity (IP + port + zone)
-- `ClusterInfo` / `ClusterStatus` — Cluster metadata and state machine
-- `SdError` — Typed error enum with 30+ variants
-- `SdInode` — On-disk inode structure (name, size, data map)
-- `VdiState` / `LockState` — Runtime VDI state and locking
+- `SdRequest` / `ResponseResult` -- 30+ request variants (read, write, VDI ops, cluster ops)
+- `ObjectId` -- 64-bit OID encoding (8-bit flags + 24-bit VDI ID + 32-bit object index)
+- `SdNode` / `NodeId` -- Node identity (IP + port + zone)
+- `ClusterInfo` / `ClusterStatus` -- Cluster metadata and state machine
+- `SdError` -- Typed error enum with 30+ variants
+- `SdInode` -- On-disk inode structure (name, size, data map)
+- `VdiState` / `LockState` -- Runtime VDI state and locking
+- Centralized tunable defaults (`defaults.rs`) for ports, timeouts, buffer sizes
 
-### sheepdog-core — Core Library
+### sheepdog-core -- Core Library
 
-- **Consistent hashing** — Virtual node ring with zone-aware placement
-- **Erasure coding** — Reed-Solomon via `reed-solomon-erasure` (encode, reconstruct, ec_policy_to_dp)
-- **Networking** — Async TCP helpers, socket FD caching
-- **Transport abstraction** — `PeerTransport` / `PeerListener` / `PeerResponder` traits for pluggable data plane (TCP or DPDK)
-- **TcpTransport** — Default transport using kernel TCP with connection pooling (`SockfdCache`)
+- **Consistent hashing** -- Virtual node ring with zone-aware placement
+- **Erasure coding** -- Reed-Solomon via `reed-solomon-erasure` (encode, reconstruct, ec_policy_to_dp)
+- **Networking** -- Async TCP helpers, socket FD caching
+- **Transport abstraction** -- `PeerTransport` / `PeerListener` / `PeerResponder` traits for pluggable data plane (TCP or DPDK)
+- **TcpTransport** -- Default transport using kernel TCP with connection pooling (`SockfdCache`)
 
-### sheep — Storage Daemon
+### sheep -- Storage Daemon
 
 The main daemon. Handles object I/O, replication, erasure coding, recovery, and exposes multiple server interfaces.
 
 ```
 sheep startup
-  ├── ClusterDriver.init()    Listen on cluster port
-  ├── ClusterDriver.join()    Connect to seeds, exchange members
-  │
-  ├── cluster_event_loop()    Join / Leave / Notify / Block / Unblock
-  ├── accept_loop()           Client TCP → dispatch to ops handler
-  ├── recovery_worker()       Background object migration
-  │
-  ├── http_server()           S3/Swift on :8000 (optional)
-  ├── nfs_server()            NFS v3 on :2049 (optional)
-  └── nbd_server()            NBD export on :10809 (optional)
+  +-- ClusterDriver.init()    Listen on cluster port
+  +-- ClusterDriver.join()    Connect to seeds, exchange members
+  |
+  +-- cluster_event_loop()    Join / Leave / Notify / Block / Unblock
+  +-- accept_loop()           Client TCP -> dispatch to ops handler
+  +-- recovery_worker()       Background object migration
+  |
+  +-- http_server()           S3/Swift on :8000 (optional)
+  +-- nfs_server()            NFS v3 on :2049 (optional)
+  +-- nbd_server()            NBD export on :10809 (optional)
 ```
 
 **Request pipeline:**
 
 ```
-Client TCP → read_request() → dispatch(SdRequest)
-                                 ├── Gateway  → forward via hash ring
-                                 │              ├── replicated write/read
-                                 │              └── EC write/read (RS encode/decode)
-                                 ├── Peer     → local object I/O
-                                 ├── Cluster  → VDI create/delete, format
-                                 └── Local    → node info, stat queries
+Client TCP -> read_request() -> dispatch(SdRequest)
+                                   +-- Gateway  -> forward via hash ring
+                                   |               +-- replicated write/read
+                                   |               +-- EC write/read (RS encode/decode)
+                                   +-- Peer     -> local object I/O
+                                   +-- Cluster  -> VDI create/delete, format
+                                   +-- Local    -> node info, stat queries
 ```
 
 **Largest modules:**
 
 | Module | Lines | Purpose |
 |--------|------:|---------|
-| `cluster/sdcluster.rs` | 1,293 | P2P TCP mesh driver |
-| `nbd/mod.rs` | 844 | NBD export server |
-| `ops/gateway.rs` | 667 | Gateway I/O (replication + EC) |
-| `recovery.rs` | 662 | Background object migration |
+| `cluster/sdcluster.rs` | 1,298 | P2P TCP mesh driver |
+| `nbd/mod.rs` | 842 | NBD export server |
+| `main.rs` | 647 | CLI args, startup orchestration |
+| `ops/gateway.rs` | 627 | Gateway I/O (replication + EC) |
+| `recovery.rs` | 613 | Background object migration |
 | `store/md.rs` | 568 | Multi-disk storage backend |
 | `object_cache.rs` | 542 | LRU object cache |
-| `ops/peer.rs` | 450 | Peer-to-peer I/O |
+| `ops/peer.rs` | 467 | Peer-to-peer I/O |
 | `ops/cluster.rs` | 440 | Cluster-wide operations |
 | `journal.rs` | 440 | Write-ahead journal |
 | `nfs/*.rs` | 1,139 | NFS v3 server (ONC RPC) |
 | `http/*.rs` | 691 | HTTP/S3/Swift API |
 
-### dog — CLI Admin Tool
+### dog -- CLI Admin Tool
 
 ```
 dog [OPTIONS] <COMMAND>
@@ -402,17 +420,17 @@ Commands:
 **VDI commands:**
 
 ```bash
-dog vdi create <name> <size>                  # Create VDI (replicated)
+dog vdi create <name> <size>                    # Create VDI (replicated)
 dog vdi create <name> <size> --copy-policy 2:1  # Create VDI (EC 2+1)
-dog vdi delete <name>                         # Delete VDI
-dog vdi list                                  # List all VDIs
-dog vdi snapshot <name> -s <tag>              # Take snapshot
-dog vdi clone <src> <dst>                     # Clone VDI
-dog vdi resize <name> <size>                  # Resize VDI
-dog vdi object <name>                         # Show object map
-dog vdi tree                                  # Show snapshot/clone tree
-dog vdi lock list                             # Show locks
-dog vdi lock unlock <name>                    # Force unlock
+dog vdi delete <name>                           # Delete VDI
+dog vdi list                                    # List all VDIs
+dog vdi snapshot <name> -s <tag>                # Take snapshot
+dog vdi clone <src> <dst>                       # Clone VDI
+dog vdi resize <name> <size>                    # Resize VDI
+dog vdi object <name>                           # Show object map
+dog vdi tree                                    # Show snapshot/clone tree
+dog vdi lock list                               # Show locks
+dog vdi lock unlock <name>                      # Force unlock
 ```
 
 **Cluster commands:**
@@ -437,7 +455,7 @@ dog node md plug <path>             # Add disk
 dog node md unplug <path>           # Remove disk
 ```
 
-### shepherd — Cluster Monitor
+### shepherd -- Cluster Monitor
 
 Heartbeat monitor for production clusters:
 
@@ -445,7 +463,7 @@ Heartbeat monitor for production clusters:
 shepherd -b 0.0.0.0 -p 7100 --heartbeat-interval 5 --failure-timeout 30
 ```
 
-### sheepfs — FUSE Filesystem
+### sheepfs -- FUSE Filesystem
 
 Mount VDIs as local files (requires libfuse/macFUSE):
 
@@ -501,14 +519,14 @@ Options:
 Built-in cluster membership with zero external dependencies. Replaces the C version's Corosync/ZooKeeper requirement.
 
 ```
-  sheep:7000 ◄─────────────► sheep:7002
-  cluster:7001                cluster:7003
-      ▲  ╲                      ╱  ▲
-      │    ╲   Heartbeat(5s)  ╱    │
-      │      ╲  Join/Leave  ╱      │
-      ▼        ▼           ▼       ▼
-              sheep:7004
-              cluster:7005
+  sheep:7000 <------------------> sheep:7002
+  cluster:7001                     cluster:7003
+      ^   \                          /   ^
+      |     \   Heartbeat(5s)      /     |
+      |       \   Join/Leave     /       |
+      v         v              v         v
+                sheep:7004
+                cluster:7005
 ```
 
 **How it works:**
@@ -517,14 +535,14 @@ Built-in cluster membership with zero external dependencies. Replaces the C vers
 2. New node opens TCP to **every** existing member (full mesh)
 3. **Heartbeat** every 5 seconds; peer declared dead after 15s silence
 4. **Leader** = node with smallest `NodeId` (IP:port)
-5. **Two-phase updates**: Leader sends `Block` → all pause → `Unblock` with result
+5. **Two-phase updates**: Leader sends `Block` -> all pause -> `Unblock` with result
 
 **Cluster messages:**
 
 | Message | Purpose |
 |---------|---------|
-| `Join { node }` | Join request (new → seed) |
-| `JoinResponse { members }` | Member list (seed → new) |
+| `Join { node }` | Join request (new -> seed) |
+| `JoinResponse { members }` | Member list (seed -> new) |
 | `Leave { node }` | Graceful departure |
 | `Heartbeat { node }` | Keepalive (5s interval) |
 | `Notify { data }` | Broadcast (format, shutdown) |
@@ -565,12 +583,12 @@ Each sheepdog object has a 64-bit **Object ID**:
 
 ### EC Strip Storage
 
-When erasure coding is active, each strip is stored with an `_N` suffix on the target node:
+When erasure coding is active, each strip is stored with an `_XX` suffix on the target node:
 
 ```
-node-A/obj/00ab000100000000_1   ← data strip 1
-node-B/obj/00ab000100000000_2   ← data strip 2
-node-C/obj/00ab000100000000_3   ← parity strip 1
+node-A/obj/00ab000100000000_01   <-- data strip 1
+node-B/obj/00ab000100000000_02   <-- data strip 2
+node-C/obj/00ab000100000000_03   <-- parity strip 1
 ```
 
 Standard replicated objects have no suffix (just the hex OID).
@@ -605,11 +623,11 @@ qemu-img info nbd://127.0.0.1:10809/mydisk  # Inspect
 S3-compatible object storage interface (feature-gated, enabled by default):
 
 ```bash
-curl http://localhost:8000/                         # List buckets
-curl -X PUT http://localhost:8000/mybucket           # Create bucket
+curl http://localhost:8000/                              # List buckets
+curl -X PUT http://localhost:8000/mybucket                # Create bucket
 curl -X PUT http://localhost:8000/mybucket/key -d "data"  # Upload
-curl http://localhost:8000/mybucket/key               # Download
-curl -X DELETE http://localhost:8000/mybucket/key      # Delete
+curl http://localhost:8000/mybucket/key                    # Download
+curl -X DELETE http://localhost:8000/mybucket/key           # Delete
 ```
 
 OpenStack Swift API also available at `/v1/{account}/`.
@@ -632,26 +650,33 @@ mount -t nfs -o port=2049,mountport=2050,nfsvers=3,tcp localhost:/ /mnt/sheep
 | Client I/O | bincode | 4-byte BE | 7000 |
 | Cluster mesh | bincode | 4-byte LE | 7001 |
 | DPDK peer I/O | bincode + UDP | DpdkPeerHeader (16B) | 7100 |
-| HTTP/S3 | HTTP/1.1 + JSON | — | 8000 |
+| HTTP/S3 | HTTP/1.1 + JSON | -- | 8000 |
 | NFS v3 | XDR / ONC RPC | RPC record mark | 2049 |
 | NBD | Big-endian binary | Fixed headers | 10809 |
 
 ---
 
-## Key Constants
+## Configuration Defaults
 
-| Constant | Value |
-|----------|-------|
-| `SD_DATA_OBJ_SIZE` | 4 MB |
-| `SD_LISTEN_PORT` | 7000 |
-| `NBD_DEFAULT_PORT` | 10809 |
-| `SD_DEFAULT_COPIES` | 3 |
-| `SD_MAX_NODES` | 6,144 |
-| `SD_NR_VDIS` | 16,777,216 |
-| `SD_DEFAULT_VNODES` | 128 |
-| `SD_EC_MAX_STRIP` | 16 |
-| `HEARTBEAT_INTERVAL` | 5 s |
-| `HEARTBEAT_TIMEOUT` | 15 s |
+Tunable defaults are centralized in `crates/sheepdog-proto/src/defaults.rs`. All values are compile-time constants, overridable via CLI flags. Protocol-level constants (wire format, object sizes, magic numbers) remain in `constants.rs`.
+
+| Category | Constant | Default |
+|----------|----------|---------|
+| Network | `SD_LISTEN_PORT` | 7000 |
+| Network | `DEFAULT_HTTP_PORT` | 8000 |
+| Network | `DEFAULT_NBD_PORT` | 10809 |
+| Network | `DEFAULT_NFS_PORT` | 2049 |
+| Network | `DEFAULT_DPDK_PORT` | 7100 |
+| Performance | `DEFAULT_CACHE_SIZE_MB` | 256 |
+| Performance | `DEFAULT_JOURNAL_SIZE_MB` | 512 |
+| Performance | `DEFAULT_TCP_MAX_CONNS_PER_NODE` | 8 |
+| Cluster | `DEFAULT_CLUSTER_HEARTBEAT_INTERVAL_SECS` | 5 |
+| Cluster | `DEFAULT_CLUSTER_HEARTBEAT_TIMEOUT_SECS` | 15 |
+| Recovery | `DEFAULT_RECOVERY_MAX_EXEC_COUNT` | 1 |
+| Shepherd | `DEFAULT_SHEPHERD_HEARTBEAT_INTERVAL_SECS` | 5 |
+| Shepherd | `DEFAULT_SHEPHERD_FAILURE_TIMEOUT_SECS` | 30 |
+
+Shell scripts source `scripts/defaults.sh` for consistent test configuration.
 
 ---
 
@@ -664,9 +689,6 @@ cargo build -p sheep
 # Without HTTP
 cargo build -p sheep --no-default-features
 
-# With NFS
-cargo build -p sheep --features nfs
-
 # With DPDK data plane (requires system DPDK)
 cargo build -p sheep --features dpdk
 
@@ -676,8 +698,7 @@ cargo build -p sheepfs
 
 | Feature | Default | Crate | Requires |
 |---------|:-------:|-------|----------|
-| `http` | yes | sheep | — |
-| `nfs` | no | sheep | — |
+| `http` | yes | sheep | -- |
 | `dpdk` | no | sheep | libdpdk (system) |
 
 ---
@@ -687,7 +708,7 @@ cargo build -p sheepfs
 | | C Sheepdog (v0.9.5) | sheepdog-rs (v0.10.0) |
 |-|---------------------|----------------------|
 | Language | C | Rust (async, memory-safe) |
-| Codebase | ~60K LOC | ~16.8K LOC |
+| Codebase | ~60K LOC | ~18K LOC |
 | Async I/O | epoll + callbacks | tokio async/await |
 | Cluster | Corosync / ZooKeeper | Built-in P2P TCP mesh |
 | External deps | corosync, libcpg | None |
@@ -723,6 +744,7 @@ cargo build -p sheepfs
 | Component | Status |
 |-----------|:------:|
 | Protocol types & OID encoding | Done |
+| Centralized config defaults | Done |
 | Consistent hashing (zone-aware) | Done |
 | P2P cluster driver | Done |
 | Local cluster driver | Done |
