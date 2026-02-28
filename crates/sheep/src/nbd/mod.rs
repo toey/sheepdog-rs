@@ -14,6 +14,7 @@ use std::io;
 use std::net::SocketAddr;
 
 use sheepdog_proto::constants::SD_DATA_OBJ_SIZE;
+use sheepdog_proto::defaults::{DEFAULT_NBD_MAX_EXPORT_NAME_LEN, DEFAULT_NBD_MAX_PAYLOAD};
 use sheepdog_proto::error::SdError;
 use sheepdog_proto::oid::ObjectId;
 use sheepdog_proto::request::{RequestHeader, ResponseResult, SdRequest};
@@ -91,14 +92,11 @@ const NBD_ENOSPC: u32 = 28;
 const NBD_ENOTSUP: u32 = 95;
 const NBD_ESHUTDOWN: u32 = 108;
 
-/// Default NBD port (IANA-reserved)
-pub const NBD_DEFAULT_PORT: u16 = 10809;
-
 /// Maximum export name length
-const MAX_EXPORT_NAME_LEN: usize = 4096;
+const MAX_EXPORT_NAME_LEN: usize = DEFAULT_NBD_MAX_EXPORT_NAME_LEN;
 
 /// Maximum NBD request payload (32 MB)
-const MAX_NBD_PAYLOAD: u32 = 32 * 1024 * 1024;
+const MAX_NBD_PAYLOAD: u32 = DEFAULT_NBD_MAX_PAYLOAD;
 
 // ─── Export State ───────────────────────────────────────────────────────────
 

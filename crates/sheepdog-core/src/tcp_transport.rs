@@ -15,14 +15,15 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, error};
 
+use sheepdog_proto::defaults::DEFAULT_TCP_MAX_RESPONSE_SIZE;
 use sheepdog_proto::error::{SdError, SdResult};
 use sheepdog_proto::request::{RequestHeader, SdRequest, SdResponse};
 
 use crate::sockfd_cache::SockfdCache;
 use crate::transport::{PeerListener, PeerRequest, PeerResponder, PeerTransport};
 
-/// Maximum response size (64 MB) — protects against corrupt length prefixes.
-const MAX_RESPONSE_SIZE: usize = 64 * 1024 * 1024;
+/// Maximum response size — protects against corrupt length prefixes.
+const MAX_RESPONSE_SIZE: usize = DEFAULT_TCP_MAX_RESPONSE_SIZE;
 
 // ─── PeerTransport implementation ─────────────────────────────────────────────
 

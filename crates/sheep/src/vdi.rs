@@ -6,6 +6,7 @@
 //! and by leveraging the type system for lock states.
 
 use sheepdog_proto::constants::SD_NR_VDIS;
+use sheepdog_proto::defaults::DEFAULT_MAX_VDI_HASH_RETRIES;
 use sheepdog_proto::error::{SdError, SdResult};
 use sheepdog_proto::hash::sd_hash;
 use sheepdog_proto::inode::SdInode;
@@ -14,7 +15,7 @@ use sheepdog_proto::oid::ObjectId;
 use crate::daemon::SystemInfo;
 
 /// Maximum number of hash collision retries when finding a free VDI ID.
-const MAX_VDI_HASH_RETRIES: u32 = 1024;
+const MAX_VDI_HASH_RETRIES: u32 = DEFAULT_MAX_VDI_HASH_RETRIES;
 
 /// Find a free VDI ID by hashing the name and probing.
 ///

@@ -41,6 +41,13 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use sheepdog_proto::constants::SD_LISTEN_PORT;
+use sheepdog_proto::defaults::{
+    DEFAULT_CACHE_SIZE_MB, DEFAULT_CLUSTER_PORT_OFFSET, DEFAULT_DPDK_PORT, DEFAULT_DPDK_QUEUES,
+    DEFAULT_HTTP_PORT, DEFAULT_JOURNAL_SIZE_MB, DEFAULT_NBD_PORT, DEFAULT_NFS_MOUNT_PORT,
+    DEFAULT_NFS_PORT, DEFAULT_TCP_MAX_CONNS_PER_NODE,
+};
+#[cfg(feature = "dpdk")]
+use sheepdog_proto::defaults::{DEFAULT_DPDK_MBUF_CACHE_SIZE, DEFAULT_DPDK_NR_MBUFS};
 use sheepdog_proto::node::{NodeId, SdNode};
 use sheepdog_core::transport::PeerTransport;
 
@@ -80,7 +87,7 @@ struct Args {
     journal: Option<PathBuf>,
 
     /// Journal size in MB
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, default_value_t = DEFAULT_JOURNAL_SIZE_MB)]
     journal_size: u64,
 
     /// Enable object cache
@@ -88,7 +95,7 @@ struct Args {
     cache: bool,
 
     /// Object cache size in MB
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = DEFAULT_CACHE_SIZE_MB)]
     cache_size: u64,
 
     /// Fault zone ID
@@ -104,27 +111,27 @@ struct Args {
     log_level: String,
 
     /// HTTP/S3 port (0 to disable)
-    #[arg(long, default_value_t = 8000)]
+    #[arg(long, default_value_t = DEFAULT_HTTP_PORT)]
     http_port: u16,
 
     /// Enable NFS server
     #[arg(long)]
     nfs: bool,
 
-    /// NFS port (default: 2049)
-    #[arg(long, default_value_t = 2049)]
+    /// NFS port
+    #[arg(long, default_value_t = DEFAULT_NFS_PORT)]
     nfs_port: u16,
 
-    /// NFS MOUNT port (default: 2050)
-    #[arg(long, default_value_t = 2050)]
+    /// NFS MOUNT port
+    #[arg(long, default_value_t = DEFAULT_NFS_MOUNT_PORT)]
     nfs_mount_port: u16,
 
     /// Enable NBD export server
     #[arg(long)]
     nbd: bool,
 
-    /// NBD server port (default: 10809)
-    #[arg(long, default_value_t = nbd::NBD_DEFAULT_PORT)]
+    /// NBD server port
+    #[arg(long, default_value_t = DEFAULT_NBD_PORT)]
     nbd_port: u16,
 
     /// Cluster driver to use: "local" (single-node) or "sdcluster" (P2P TCP mesh)
@@ -137,7 +144,7 @@ struct Args {
     seeds: Vec<String>,
 
     /// Cluster communication port offset from listen port (sdcluster driver only)
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = DEFAULT_CLUSTER_PORT_OFFSET)]
     cluster_port_offset: u16,
 
     /// Enable DPDK data plane acceleration for peer I/O
@@ -153,7 +160,7 @@ struct Args {
     dpdk_ports: String,
 
     /// DPDK data plane UDP port
-    #[arg(long, default_value_t = 7100)]
+    #[arg(long, default_value_t = DEFAULT_DPDK_PORT)]
     dpdk_port: u16,
 
     /// DPDK IP address for data plane NIC
@@ -161,7 +168,7 @@ struct Args {
     dpdk_addr: Option<String>,
 
     /// Number of DPDK RX/TX queues per port
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = DEFAULT_DPDK_QUEUES)]
     dpdk_queues: u16,
 }
 
@@ -227,8 +234,8 @@ async fn main() {
             let config = sheepdog_dpdk::DpdkConfig {
                 eal_args: shell_words_split(&args.dpdk_eal_args),
                 nr_queues: args.dpdk_queues,
-                nr_mbufs: 8191,
-                mbuf_cache_size: 250,
+                nr_mbufs: DEFAULT_DPDK_NR_MBUFS,
+                mbuf_cache_size: DEFAULT_DPDK_MBUF_CACHE_SIZE,
                 port_ids: args
                     .dpdk_ports
                     .split(',')
@@ -258,7 +265,7 @@ async fn main() {
         }
     } else {
         info!("using TCP peer transport (default)");
-        Arc::new(sheepdog_core::tcp_transport::TcpTransport::new(8))
+        Arc::new(sheepdog_core::tcp_transport::TcpTransport::new(DEFAULT_TCP_MAX_CONNS_PER_NODE))
     };
 
     // Build system info

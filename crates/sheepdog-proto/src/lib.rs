@@ -7,6 +7,7 @@
 //! error types, and core data structures shared by all sheepdog components.
 
 pub mod constants;
+pub mod defaults;
 pub mod error;
 pub mod hash;
 pub mod inode;

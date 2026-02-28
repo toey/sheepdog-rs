@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info};
 
+use sheepdog_proto::defaults::DEFAULT_LOCAL_EVENT_CHANNEL_SIZE;
 use sheepdog_proto::error::{SdError, SdResult};
 use sheepdog_proto::node::SdNode;
 
@@ -59,7 +60,7 @@ impl LocalDriver {
     /// `local_addr` is the address that `get_local_addr` will return.
     /// No listener is actually created.
     pub fn new(local_addr: SocketAddr) -> Self {
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::channel(DEFAULT_LOCAL_EVENT_CHANNEL_SIZE);
         Self {
             state: RwLock::new(LocalState {
                 this_node: None,

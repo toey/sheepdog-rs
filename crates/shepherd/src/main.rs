@@ -14,6 +14,11 @@ mod handler;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use clap::Parser;
+use sheepdog_proto::constants::SD_LISTEN_PORT;
+use sheepdog_proto::defaults::{
+    DEFAULT_SHEPHERD_FAILURE_TIMEOUT_SECS, DEFAULT_SHEPHERD_HEARTBEAT_INTERVAL_SECS,
+    DEFAULT_SHEPHERD_PORT,
+};
 use tracing::{error, info};
 
 /// Shepherd cluster coordination daemon
@@ -25,19 +30,19 @@ struct Args {
     bind_addr: String,
 
     /// Listen port
-    #[arg(short = 'p', long, default_value_t = 7100)]
+    #[arg(short = 'p', long, default_value_t = DEFAULT_SHEPHERD_PORT)]
     port: u16,
 
     /// Sheep daemon port to monitor
-    #[arg(long, default_value_t = 7000)]
+    #[arg(long, default_value_t = SD_LISTEN_PORT)]
     sheep_port: u16,
 
     /// Heartbeat interval in seconds
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = DEFAULT_SHEPHERD_HEARTBEAT_INTERVAL_SECS)]
     heartbeat_interval: u64,
 
     /// Node failure timeout in seconds (missed heartbeats)
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = DEFAULT_SHEPHERD_FAILURE_TIMEOUT_SECS)]
     failure_timeout: u64,
 
     /// Log level

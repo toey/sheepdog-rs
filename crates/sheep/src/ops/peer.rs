@@ -462,10 +462,6 @@ fn get_obj_path(
     oid: ObjectId,
     ec_index: u8,
 ) -> std::path::PathBuf {
-    let obj_dir = sys.obj_path();
-    if ec_index > 0 {
-        obj_dir.join(format!("{:016x}_{}", oid.raw(), ec_index))
-    } else {
-        obj_dir.join(format!("{:016x}", oid.raw()))
-    }
+    use crate::store::common::oid_to_filename;
+    sys.obj_path().join(oid_to_filename(oid, ec_index))
 }

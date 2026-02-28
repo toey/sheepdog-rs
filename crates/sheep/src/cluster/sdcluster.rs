@@ -33,6 +33,11 @@ use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
+use sheepdog_proto::defaults::{
+    DEFAULT_CLUSTER_EVENT_CHANNEL_SIZE, DEFAULT_CLUSTER_HEARTBEAT_INTERVAL_SECS,
+    DEFAULT_CLUSTER_HEARTBEAT_TIMEOUT_SECS, DEFAULT_CLUSTER_MAX_MESSAGE_SIZE,
+    DEFAULT_CLUSTER_PEER_WRITE_CHANNEL_SIZE, DEFAULT_CLUSTER_PORT_OFFSET,
+};
 use sheepdog_proto::error::{SdError, SdResult};
 use sheepdog_proto::node::SdNode;
 
@@ -43,16 +48,16 @@ use super::{ClusterDriver, ClusterEvent};
 // ---------------------------------------------------------------------------
 
 /// Interval between heartbeat messages.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(DEFAULT_CLUSTER_HEARTBEAT_INTERVAL_SECS);
 
 /// If no message is received from a peer within this window it is declared dead.
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(DEFAULT_CLUSTER_HEARTBEAT_TIMEOUT_SECS);
 
-/// Maximum size of a single wire message (8 MB).
-const MAX_MESSAGE_SIZE: u32 = 8 * 1024 * 1024;
+/// Maximum size of a single wire message.
+const MAX_MESSAGE_SIZE: u32 = DEFAULT_CLUSTER_MAX_MESSAGE_SIZE;
 
 /// Channel buffer size for the event queue.
-const EVENT_CHANNEL_SIZE: usize = 512;
+const EVENT_CHANNEL_SIZE: usize = DEFAULT_CLUSTER_EVENT_CHANNEL_SIZE;
 
 // ---------------------------------------------------------------------------
 // Wire messages
@@ -337,7 +342,7 @@ impl SdClusterDriver {
                 debug!("sdcluster: peer {} joining via {}", key, peer_addr);
 
                 // Register the peer.
-                let (write_tx, mut write_rx) = mpsc::channel::<ClusterMessage>(128);
+                let (write_tx, mut write_rx) = mpsc::channel::<ClusterMessage>(DEFAULT_CLUSTER_PEER_WRITE_CHANNEL_SIZE);
 
                 {
                     let mut s = state.write().await;
@@ -623,7 +628,7 @@ impl SdClusterDriver {
             }
         };
 
-        let (write_tx, mut write_rx) = mpsc::channel::<ClusterMessage>(128);
+        let (write_tx, mut write_rx) = mpsc::channel::<ClusterMessage>(DEFAULT_CLUSTER_PEER_WRITE_CHANNEL_SIZE);
 
         {
             let mut s = state.write().await;
@@ -743,7 +748,7 @@ impl SdClusterDriver {
         // Read join response (may be ignored for secondary connections).
         let _resp = Self::read_message(&mut reader).await?;
 
-        let (write_tx, mut write_rx) = mpsc::channel::<ClusterMessage>(128);
+        let (write_tx, mut write_rx) = mpsc::channel::<ClusterMessage>(DEFAULT_CLUSTER_PEER_WRITE_CHANNEL_SIZE);
 
         {
             let mut s = state.write().await;
@@ -1063,7 +1068,7 @@ impl SdClusterDriverBuilder {
     pub fn new() -> Self {
         Self {
             seeds: Vec::new(),
-            port_offset: 1,
+            port_offset: DEFAULT_CLUSTER_PORT_OFFSET,
         }
     }
 

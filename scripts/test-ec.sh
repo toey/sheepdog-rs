@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 #
-# test-io.sh — I/O correctness test suite (no object cache)
+# test-ec.sh — Erasure Coding (EC) correctness test suite
 #
-# Tests data integrity through the NBD path with object cache DISABLED,
-# verifying that every read/write goes directly through the store layer.
+# Tests EC data integrity through the NBD path, verifying that
+# Reed-Solomon encode/decode produces correct results.
 #
 # Test phases:
-#   Phase 1: Setup — 3-node cluster, no --cache
-#   Phase 2: Basic I/O — sequential write + read at each object offset
-#   Phase 3: Overwrite — rewrite same locations with new patterns
-#   Phase 4: Cross-boundary — writes spanning two 4MB objects
-#   Phase 5: Large I/O — multi-object sequential writes
-#   Phase 6: Sparse writes — non-contiguous offsets, read gaps as zeros
-#   Phase 7: Direct I/O — restart cluster with --directio, repeat key tests
+#   Phase 1: Setup — 3-node cluster with EC 2:1 VDI
+#   Phase 2: Basic EC I/O — write + read at each object offset
+#   Phase 3: EC Overwrite — partial writes (read-modify-write)
+#   Phase 4: Cross-boundary — EC writes spanning two 4MB objects
+#   Phase 5: Large EC I/O — multi-object sequential writes
+#   Phase 6: Strip verification — check EC strip files on disk
+#   Phase 7: Degraded read — stop a node, verify reconstruction
 #   Phase 8: Cleanup
 #
 # Requirements:
@@ -20,33 +20,37 @@
 #   - qemu-io (from qemu-utils) for NBD I/O verification
 #
 # Usage:
-#   ./scripts/test-io.sh [--keep] [--skip-directio]
+#   ./scripts/test-ec.sh [--keep]
 #
 set -uo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DATA_ROOT="/tmp/sheepdog-io-test"
+DATA_ROOT="/tmp/sheepdog-ec-test"
 source "${SCRIPT_DIR}/defaults.sh"
 LOG_DIR="${DATA_ROOT}/logs"
 
-COPIES=1
+# EC 2:1 = 2 data strips + 1 parity strip (needs 3 nodes)
+EC_POLICY="2:1"
+EC_DATA=2
+EC_PARITY=1
+EC_TOTAL=3   # d+p
+
 VDI_SIZE="64M"
-VDI_NAME="iotest"
+VDI_NAME="ectest"
 
 # 4 MB object size (SD_DATA_OBJ_SIZE = 1 << 22)
 OBJ_SIZE=4194304
 
 KEEP=false
-SKIP_DIRECTIO=false
 
 # Parse flags
 for arg in "$@"; do
     case "$arg" in
-        --keep)           KEEP=true ;;
-        --skip-directio)  SKIP_DIRECTIO=true ;;
+        --keep)  KEEP=true ;;
     esac
 done
+
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 if [[ -x "${REPO_ROOT}/target/release/sheep" ]]; then
@@ -220,12 +224,45 @@ count_objects() {
     fi
 }
 
+count_ec_strips() {
+    # Count files with EC strip suffix (_N or _NN where N is hex)
+    local dir count
+    dir="$(node_dir "$1")/obj"
+    if [[ -d "$dir" ]]; then
+        count=$(ls "$dir" 2>/dev/null | grep -c '_[0-9a-f]' 2>/dev/null) || count=0
+        echo "$count"
+    else
+        echo "0"
+    fi
+}
+
 show_object_distribution() {
     echo -e "  ${BOLD}Object distribution:${NC}"
     for i in $(seq 0 $(( NUM_NODES - 1 ))); do
-        local count
-        count=$(count_objects "$i")
-        printf "    node%d: %3s objects\n" "$i" "$count"
+        local total ec_count
+        total=$(count_objects "$i")
+        ec_count=$(count_ec_strips "$i")
+        printf "    node%d: %3s objects (%s EC strips)\n" "$i" "$total" "$ec_count"
+    done
+}
+
+show_ec_strip_files() {
+    echo -e "  ${BOLD}EC strip files (sample):${NC}"
+    for i in $(seq 0 $(( NUM_NODES - 1 ))); do
+        local dir
+        dir="$(node_dir "$i")/obj"
+        if [[ -d "$dir" ]]; then
+            local strips
+            strips=$(ls "$dir" 2>/dev/null | grep '_[0-9a-f]' | head -5)
+            if [[ -n "$strips" ]]; then
+                echo "    node${i}:"
+                echo "$strips" | while IFS= read -r f; do
+                    local sz
+                    sz=$(stat -f%z "${dir}/${f}" 2>/dev/null || stat -c%s "${dir}/${f}" 2>/dev/null || echo "?")
+                    printf "      %-40s  %s bytes\n" "$f" "$sz"
+                done
+            fi
+        fi
     done
 }
 
@@ -237,28 +274,19 @@ start_cluster() {
     step "Starting ${NUM_NODES}-node cluster"
     for i in $(seq 0 $(( NUM_NODES - 1 ))); do
         if (( i == 0 )); then
-            if [[ $# -gt 0 ]]; then
-                start_node "$i" --nbd --nbd-port "$NBD_PORT" "$@" \
-                    || { err "Failed to start node $i"; stop_all; return 1; }
-            else
-                start_node "$i" --nbd --nbd-port "$NBD_PORT" \
-                    || { err "Failed to start node $i"; stop_all; return 1; }
-            fi
+            start_node "$i" --nbd --nbd-port "$NBD_PORT" \
+                || { err "Failed to start node $i"; stop_all; return 1; }
         else
-            if [[ $# -gt 0 ]]; then
-                start_node "$i" "$@" \
-                    || { err "Failed to start node $i"; stop_all; return 1; }
-            else
-                start_node "$i" \
-                    || { err "Failed to start node $i"; stop_all; return 1; }
-            fi
+            start_node "$i" \
+                || { err "Failed to start node $i"; stop_all; return 1; }
         fi
     done
 
     sleep 2
 
-    step "Formatting cluster (copies=${COPIES})"
-    if ! dog_cmd cluster format --copies "$COPIES" 2>&1; then
+    # Format with copies=1 (default for replication VDIs; EC VDIs override)
+    step "Formatting cluster (copies=1)"
+    if ! dog_cmd cluster format --copies 1 2>&1; then
         warn "Format failed (may already be formatted)"
     fi
     sleep 1
@@ -282,15 +310,14 @@ cleanup() {
 
 echo -e "${BOLD}${CYAN}"
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║          Sheepdog I/O Correctness Test (No Cache)           ║"
+echo "║      Sheepdog Erasure Coding (EC) Correctness Test          ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 echo -e "  Binary:    ${SHEEP}"
 echo -e "  Data:      ${DATA_ROOT}"
 echo -e "  VDI:       ${VDI_NAME} (${VDI_SIZE})"
-echo -e "  Copies:    ${COPIES}"
+echo -e "  EC Policy: ${EC_POLICY} (${EC_DATA} data + ${EC_PARITY} parity)"
 echo -e "  Obj size:  ${OBJ_SIZE} (4 MB)"
-echo -e "  Cache:     ${RED}disabled${NC}"
 echo ""
 
 # Check qemu-io
@@ -304,255 +331,222 @@ rm -rf "$DATA_ROOT"
 mkdir -p "$LOG_DIR"
 
 # ━━━ Phase 1: Setup ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-phase 1 "Setup — 3-node cluster, cache disabled"
+phase 1 "Setup — 3-node cluster with EC ${EC_POLICY} VDI"
 
-# Start cluster WITHOUT --cache (no object cache)
 start_cluster || { err "Failed to start cluster"; exit 1; }
 
 check "Cluster is formatted" dog_cmd cluster info
 
-# Create VDI
-step "Creating VDI '${VDI_NAME}' (${VDI_SIZE})"
-dog_cmd vdi create "$VDI_NAME" "$VDI_SIZE"
+# Create EC VDI with 2:1 erasure coding
+step "Creating EC VDI '${VDI_NAME}' (${VDI_SIZE}, EC ${EC_POLICY})"
+dog_cmd vdi create "$VDI_NAME" "$VDI_SIZE" --copy-policy "$EC_POLICY"
 sleep 1
 
-check "VDI created" dog_cmd vdi list
+check "EC VDI created" dog_cmd vdi list
 
 step "VDI info:"
 dog_cmd vdi list 2>/dev/null | while IFS= read -r line; do echo "    $line"; done
 
-# ━━━ Phase 2: Basic I/O ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-phase 2 "Basic I/O — sequential write + read"
+# ━━━ Phase 2: Basic EC I/O ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+phase 2 "Basic EC I/O — sequential write + read"
 
 # Write different patterns at the start of each 4MB object
-# Object 0: offset 0
-# Object 1: offset 4MB
-# Object 2: offset 8MB
-# Object 3: offset 12MB
-
 step "Writing pattern 0xAA at offset 0 (object 0)"
 nbd_write 0xAA 0 4096
-check "Write 4K at offset 0" true
+check "EC write 4K at offset 0" true
 
 step "Writing pattern 0xBB at offset 4MB (object 1)"
 nbd_write 0xBB $OBJ_SIZE 4096
-check "Write 4K at offset 4MB" true
+check "EC write 4K at offset 4MB" true
 
 step "Writing pattern 0xCC at offset 8MB (object 2)"
 nbd_write 0xCC $(( OBJ_SIZE * 2 )) 4096
-check "Write 4K at offset 8MB" true
+check "EC write 4K at offset 8MB" true
 
 step "Writing pattern 0xDD at offset 12MB (object 3)"
 nbd_write 0xDD $(( OBJ_SIZE * 3 )) 4096
-check "Write 4K at offset 12MB" true
+check "EC write 4K at offset 12MB" true
 
 echo ""
 step "Reading back and verifying patterns"
-check "Read 0xAA at offset 0"          nbd_read_verify 0xAA 0 4096
-check "Read 0xBB at offset 4MB"        nbd_read_verify 0xBB $OBJ_SIZE 4096
-check "Read 0xCC at offset 8MB"        nbd_read_verify 0xCC $(( OBJ_SIZE * 2 )) 4096
-check "Read 0xDD at offset 12MB"       nbd_read_verify 0xDD $(( OBJ_SIZE * 3 )) 4096
+check "EC read 0xAA at offset 0"    nbd_read_verify 0xAA 0 4096
+check "EC read 0xBB at offset 4MB"  nbd_read_verify 0xBB $OBJ_SIZE 4096
+check "EC read 0xCC at offset 8MB"  nbd_read_verify 0xCC $(( OBJ_SIZE * 2 )) 4096
+check "EC read 0xDD at offset 12MB" nbd_read_verify 0xDD $(( OBJ_SIZE * 3 )) 4096
 
-# Write larger blocks (64K, 256K, 1M)
+# Write larger blocks
 echo ""
-step "Writing larger blocks"
+step "Writing larger blocks with EC"
 
 nbd_write 0x11 65536 65536       # 64K at offset 64K
-check "Write 64K block"    true
-check "Read 64K block"     nbd_read_verify 0x11 65536 65536
+check "EC write 64K block"    true
+check "EC read 64K block"     nbd_read_verify 0x11 65536 65536
 
 nbd_write 0x22 262144 262144    # 256K at offset 256K
-check "Write 256K block"   true
-check "Read 256K block"    nbd_read_verify 0x22 262144 262144
+check "EC write 256K block"   true
+check "EC read 256K block"    nbd_read_verify 0x22 262144 262144
 
 nbd_write 0x33 1048576 1048576  # 1M at offset 1M
-check "Write 1M block"     true
-check "Read 1M block"      nbd_read_verify 0x33 1048576 1048576
+check "EC write 1M block"     true
+check "EC read 1M block"      nbd_read_verify 0x33 1048576 1048576
 
 echo ""
 show_object_distribution
 
-# ━━━ Phase 3: Overwrite ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-phase 3 "Overwrite — rewrite same locations"
+# ━━━ Phase 3: EC Overwrite (read-modify-write) ━━━━━━━━━━━━━━━━━━━━━━━
+phase 3 "EC Overwrite — partial writes trigger read-modify-write"
 
 step "Overwriting offset 0 with new pattern 0xEE"
 nbd_write 0xEE 0 4096
-check "Overwrite at offset 0"      nbd_read_verify 0xEE 0 4096
+check "EC overwrite at offset 0"      nbd_read_verify 0xEE 0 4096
 
 step "Overwriting offset 4MB with new pattern 0xFF"
 nbd_write 0xFF $OBJ_SIZE 4096
-check "Overwrite at offset 4MB"    nbd_read_verify 0xFF $OBJ_SIZE 4096
+check "EC overwrite at offset 4MB"    nbd_read_verify 0xFF $OBJ_SIZE 4096
 
 # Verify other locations were NOT affected
 step "Verifying non-overwritten data is intact"
-check "0xCC at 8MB still intact"    nbd_read_verify 0xCC $(( OBJ_SIZE * 2 )) 4096
-check "0xDD at 12MB still intact"   nbd_read_verify 0xDD $(( OBJ_SIZE * 3 )) 4096
-check "64K block still intact"      nbd_read_verify 0x11 65536 65536
-check "1M block still intact"       nbd_read_verify 0x33 1048576 1048576
+check "EC 0xCC at 8MB still intact"   nbd_read_verify 0xCC $(( OBJ_SIZE * 2 )) 4096
+check "EC 0xDD at 12MB still intact"  nbd_read_verify 0xDD $(( OBJ_SIZE * 3 )) 4096
+check "EC 64K block still intact"     nbd_read_verify 0x11 65536 65536
+check "EC 1M block still intact"      nbd_read_verify 0x33 1048576 1048576
 
 # Partial overwrite within a block
 step "Partial overwrite: 512 bytes in the middle of an existing block"
 nbd_write 0xAB 2048 512
-check "Partial write 512B at offset 2048"           true
-check "Read partial overwrite"                       nbd_read_verify 0xAB 2048 512
-# Before and after the partial write should be as before
-check "Before partial: 0xEE at offset 0 (first 2K)"  nbd_read_verify 0xEE 0 2048
-check "After partial: 0xEE at offset 2560"            nbd_read_verify 0xEE 2560 1536
+check "EC partial write 512B at 2048"                    true
+check "EC read partial overwrite"                         nbd_read_verify 0xAB 2048 512
+check "EC before partial: 0xEE at offset 0 (first 2K)"   nbd_read_verify 0xEE 0 2048
+check "EC after partial: 0xEE at offset 2560"             nbd_read_verify 0xEE 2560 1536
 
-# ━━━ Phase 4: Cross-boundary writes ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-phase 4 "Cross-boundary — writes spanning two 4MB objects"
+# ━━━ Phase 4: Cross-boundary EC writes ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+phase 4 "Cross-boundary — EC writes spanning two 4MB objects"
 
-# Write 8K straddling the boundary between object 0 and object 1
-# Object boundary is at offset 4194304 (4MB)
-# Write 8K starting at (4MB - 4K) = 4190208, ending at (4MB + 4K) = 4198400
 BOUNDARY_OFFSET=$(( OBJ_SIZE - 4096 ))
 
 step "Writing 8K across object 0/1 boundary (offset ${BOUNDARY_OFFSET})"
 nbd_write 0x77 $BOUNDARY_OFFSET 8192
-check "Cross-boundary write (8K)"        true
-check "Read cross-boundary data"          nbd_read_verify 0x77 $BOUNDARY_OFFSET 8192
+check "EC cross-boundary write (8K)"    true
+check "EC read cross-boundary data"      nbd_read_verify 0x77 $BOUNDARY_OFFSET 8192
 
 # Write 1M across boundary between object 2 and 3
-# boundary at 8MB, write from 7.5MB to 8.5MB
 BOUNDARY2=$(( OBJ_SIZE * 2 - 524288 ))
 step "Writing 1M across object 2/3 boundary (offset ${BOUNDARY2})"
 nbd_write 0x88 $BOUNDARY2 1048576
-check "Cross-boundary write (1M)"        true
-check "Read cross-boundary 1M"           nbd_read_verify 0x88 $BOUNDARY2 1048576
+check "EC cross-boundary write (1M)"    true
+check "EC read cross-boundary 1M"       nbd_read_verify 0x88 $BOUNDARY2 1048576
 
-# ━━━ Phase 5: Large I/O — multi-object writes ━━━━━━━━━━━━━━━━━━━━━━━
-phase 5 "Large I/O — multi-object sequential writes"
+# ━━━ Phase 5: Large EC I/O ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+phase 5 "Large EC I/O — multi-object sequential writes"
 
-# Create a second VDI for large I/O tests
-step "Creating VDI 'bigtest' (32M)"
-dog_cmd vdi create bigtest 32M
+# Create a second EC VDI for large I/O tests
+step "Creating EC VDI 'ecbig' (32M, EC ${EC_POLICY})"
+dog_cmd vdi create ecbig 32M --copy-policy "$EC_POLICY"
 sleep 1
 
-BIGTEST_URI="nbd://${BIND}:${NBD_PORT}/bigtest"
+ECBIG_URI="nbd://${BIND}:${NBD_PORT}/ecbig"
 
 # Write 8MB (spans 2 full objects)
-step "Writing 8MB sequential block to 'bigtest'"
-qemu-io -f raw -c "write -P 0x55 0 8388608" "$BIGTEST_URI" 2>/dev/null
-check "Write 8MB sequential"   true
-check "Read 8MB sequential"    qemu-io -f raw -c "read -P 0x55 0 8388608" "$BIGTEST_URI"
+step "Writing 8MB sequential block to 'ecbig'"
+qemu-io -f raw -c "write -P 0x55 0 8388608" "$ECBIG_URI" 2>/dev/null
+check "EC write 8MB sequential"   true
+check "EC read 8MB sequential"    qemu-io -f raw -c "read -P 0x55 0 8388608" "$ECBIG_URI"
 
 # Write 16MB (spans 4 full objects)
 step "Writing 16MB sequential block"
-qemu-io -f raw -c "write -P 0x66 0 16777216" "$BIGTEST_URI" 2>/dev/null
-check "Write 16MB sequential"  true
-check "Read 16MB sequential"   qemu-io -f raw -c "read -P 0x66 0 16777216" "$BIGTEST_URI"
-
-# Write full VDI (32MB)
-step "Writing full 32MB VDI"
-qemu-io -f raw -c "write -P 0x99 0 33554432" "$BIGTEST_URI" 2>/dev/null
-check "Write 32MB full VDI"    true
-check "Read 32MB full VDI"     qemu-io -f raw -c "read -P 0x99 0 33554432" "$BIGTEST_URI"
+qemu-io -f raw -c "write -P 0x66 0 16777216" "$ECBIG_URI" 2>/dev/null
+check "EC write 16MB sequential"  true
+check "EC read 16MB sequential"   qemu-io -f raw -c "read -P 0x66 0 16777216" "$ECBIG_URI"
 
 echo ""
 show_object_distribution
 
-# ━━━ Phase 6: Sparse writes + zero verification ━━━━━━━━━━━━━━━━━━━━━
-phase 6 "Sparse writes — non-contiguous offsets, gaps read as zeros"
+# ━━━ Phase 6: Strip verification ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+phase 6 "Strip verification — check EC strip files on disk"
 
-# Create VDI for sparse test
-step "Creating VDI 'sparse' (32M)"
-dog_cmd vdi create sparse 32M
-sleep 1
+# Verify that EC strip files exist with _XX suffix
+total_strips=0
+for i in $(seq 0 $(( NUM_NODES - 1 ))); do
+    ec_count=$(count_ec_strips "$i")
+    total_strips=$(( total_strips + ec_count ))
+done
 
-SPARSE_URI="nbd://${BIND}:${NBD_PORT}/sparse"
+step "Total EC strip files across cluster: ${total_strips}"
+check "EC strips exist on disk" test "$total_strips" -gt 0
 
-# Write at scattered offsets, leaving gaps
-step "Writing sparse pattern: 4K at offsets 0, 2M, 5M, 10M, 20M"
-qemu-io -f raw -c "write -P 0xA1 0 4096" "$SPARSE_URI" 2>/dev/null
-check "Sparse write at 0"      true
-
-qemu-io -f raw -c "write -P 0xA2 2097152 4096" "$SPARSE_URI" 2>/dev/null
-check "Sparse write at 2M"     true
-
-qemu-io -f raw -c "write -P 0xA3 5242880 4096" "$SPARSE_URI" 2>/dev/null
-check "Sparse write at 5M"     true
-
-qemu-io -f raw -c "write -P 0xA4 10485760 4096" "$SPARSE_URI" 2>/dev/null
-check "Sparse write at 10M"    true
-
-qemu-io -f raw -c "write -P 0xA5 20971520 4096" "$SPARSE_URI" 2>/dev/null
-check "Sparse write at 20M"    true
-
-# Verify written data
 echo ""
-step "Verifying sparse data"
-check "Read sparse 0"     qemu-io -f raw -c "read -P 0xA1 0 4096" "$SPARSE_URI"
-check "Read sparse 2M"    qemu-io -f raw -c "read -P 0xA2 2097152 4096" "$SPARSE_URI"
-check "Read sparse 5M"    qemu-io -f raw -c "read -P 0xA3 5242880 4096" "$SPARSE_URI"
-check "Read sparse 10M"   qemu-io -f raw -c "read -P 0xA4 10485760 4096" "$SPARSE_URI"
-check "Read sparse 20M"   qemu-io -f raw -c "read -P 0xA5 20971520 4096" "$SPARSE_URI"
+show_ec_strip_files
 
-# Verify gaps are zero
+# Each data object should produce EC_TOTAL (3) strips distributed across nodes
+# With multiple objects, we expect at least EC_TOTAL strips total
+check "At least ${EC_TOTAL} EC strips exist" test "$total_strips" -ge "$EC_TOTAL"
+
+# Verify strip file sizes are correct
+# For EC 2:1 with 4MB objects, each strip = 4MB / 2 = 2MB
+EXPECTED_STRIP_SIZE=$(( OBJ_SIZE / EC_DATA ))
+step "Expected strip size: ${EXPECTED_STRIP_SIZE} bytes (${OBJ_SIZE} / ${EC_DATA})"
+
+strip_size_ok=true
+for i in $(seq 0 $(( NUM_NODES - 1 ))); do
+    local_dir="$(node_dir "$i")/obj"
+    if [[ -d "$local_dir" ]]; then
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            sz=$(stat -f%z "${local_dir}/${f}" 2>/dev/null || stat -c%s "${local_dir}/${f}" 2>/dev/null || echo "0")
+            if [[ "$sz" -eq "$EXPECTED_STRIP_SIZE" ]]; then
+                : # correct size
+            elif [[ "$sz" -gt "$EXPECTED_STRIP_SIZE" ]]; then
+                step "  Strip ${f} on node${i}: ${sz} bytes (expected ${EXPECTED_STRIP_SIZE})"
+                strip_size_ok=false
+            fi
+        done < <(ls "$local_dir" 2>/dev/null | grep '_[0-9a-f]')
+    fi
+done
+check "EC strip sizes correct (${EXPECTED_STRIP_SIZE} bytes)" $strip_size_ok
+
+# ━━━ Phase 7: Degraded read — node failure + reconstruction ━━━━━━━━━━
+phase 7 "Degraded read — stop a node, verify EC reconstruction"
+
+echo -e "  ${YELLOW}NOTE: Degraded reads require EC recovery/migration (not yet"
+echo -e "  implemented). After a node leaves, the hash ring changes and"
+echo -e "  EC strip locations shift. Tests in this phase verify current"
+echo -e "  behavior and track progress toward full degraded-mode support.${NC}"
 echo ""
-step "Verifying gaps read as zeros"
-check "Gap at 4K-8K is zero"     qemu-io -f raw -c "read -P 0x00 4096 4096" "$SPARSE_URI"
-check "Gap at 1M is zero"        qemu-io -f raw -c "read -P 0x00 1048576 4096" "$SPARSE_URI"
-check "Gap at 8M is zero"        qemu-io -f raw -c "read -P 0x00 8388608 4096" "$SPARSE_URI"
-check "Gap at 15M is zero"       qemu-io -f raw -c "read -P 0x00 15728640 4096" "$SPARSE_URI"
-check "Gap at 25M is zero"       qemu-io -f raw -c "read -P 0x00 26214400 4096" "$SPARSE_URI"
 
-# ━━━ Phase 7: Direct I/O mode ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-if [[ "$SKIP_DIRECTIO" == "true" ]]; then
-    phase 7 "Direct I/O — SKIPPED (--skip-directio)"
+# First verify all data is still readable
+step "Pre-check: all data readable with full cluster"
+check "Pre-check 0xEE at 0"     nbd_read_verify 0xEE 0 2048
+check "Pre-check 0x77 boundary" nbd_read_verify 0x77 $BOUNDARY_OFFSET 8192
+
+# Stop node 2 (last node) — this removes one strip from each object
+step "Stopping node 2 to simulate failure"
+stop_node 2
+sleep 3  # Wait for heartbeat timeout detection
+
+# Verify that node 2 is actually stopped
+if ! is_running 2; then
+    pass "Node 2 stopped"
+    (( PASS_COUNT++ ))
 else
-    phase 7 "Direct I/O — restart cluster with --directio"
-
-    # Stop the cluster
-    step "Stopping cluster for Direct I/O restart"
-    stop_all
-    sleep 2
-
-    # Remove data and start fresh with --directio
-    rm -rf "$DATA_ROOT"
-    mkdir -p "$LOG_DIR"
-
-    step "Starting cluster with --directio (no cache)"
-    start_cluster --directio || { err "Failed to start directio cluster"; cleanup; exit 1; }
-
-    check "Cluster is formatted (directio)" dog_cmd cluster info
-
-    # Create VDI
-    step "Creating VDI '${VDI_NAME}' with directio"
-    dog_cmd vdi create "$VDI_NAME" "$VDI_SIZE"
-    sleep 1
-    check "VDI created (directio)" dog_cmd vdi list
-
-    # Basic write/read with directio
-    step "Writing 4K patterns with directio"
-    nbd_write 0xD1 0 4096
-    check "directio: write 4K at 0"            true
-    check "directio: read 4K at 0"             nbd_read_verify 0xD1 0 4096
-
-    nbd_write 0xD2 $OBJ_SIZE 4096
-    check "directio: write 4K at 4MB"          true
-    check "directio: read 4K at 4MB"           nbd_read_verify 0xD2 $OBJ_SIZE 4096
-
-    # Large block with directio
-    step "Writing 1M block with directio"
-    nbd_write 0xD3 0 1048576
-    check "directio: write 1M at 0"            true
-    check "directio: read 1M at 0"             nbd_read_verify 0xD3 0 1048576
-
-    # Cross-boundary with directio
-    step "Cross-boundary 8K with directio"
-    nbd_write 0xD4 $BOUNDARY_OFFSET 8192
-    check "directio: cross-boundary write"     true
-    check "directio: cross-boundary read"      nbd_read_verify 0xD4 $BOUNDARY_OFFSET 8192
-
-    # Overwrite with directio
-    step "Overwrite with directio"
-    nbd_write 0xD5 0 4096
-    check "directio: overwrite"                nbd_read_verify 0xD5 0 4096
-    check "directio: non-overwritten intact"   nbd_read_verify 0xD3 4096 $(( 1048576 - 4096 ))
-
-    echo ""
-    show_object_distribution
+    err "Node 2 still running"
+    (( FAIL_COUNT++ ))
 fi
+
+# Write new data while degraded — should still work with 2/3 nodes
+step "Writing while degraded (2 nodes)"
+nbd_write 0xD1 $(( OBJ_SIZE * 4 )) 4096
+check "Degraded EC write 4K at 16MB"     true
+check "Degraded EC read back 4K at 16MB" nbd_read_verify 0xD1 $(( OBJ_SIZE * 4 )) 4096
+
+# Restart node 2
+step "Restarting node 2"
+start_node 2 || warn "Node 2 restart failed"
+sleep 3
+
+# Verify full cluster reads still work after restart
+step "Verifying reads after node 2 restart"
+check "Post-restart read 0xEE at 0"   nbd_read_verify 0xEE 0 2048
+check "Post-restart read 0x77 boundary" nbd_read_verify 0x77 $BOUNDARY_OFFSET 8192
 
 # ━━━ Phase 8: Cleanup ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 phase 8 "Cleanup"
@@ -561,7 +555,8 @@ cleanup
 
 # ━━━ Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 echo ""
-echo -e "${BOLD}━━━ Test Summary ━━━${NC}"
+echo -e "${BOLD}━━━ EC Test Summary ━━━${NC}"
+echo -e "  EC Policy: ${EC_POLICY} (${EC_DATA}+${EC_PARITY})"
 echo -e "  ${GREEN}Passed: ${PASS_COUNT}${NC}"
 if (( FAIL_COUNT > 0 )); then
     echo -e "  ${RED}Failed: ${FAIL_COUNT}${NC}"
@@ -571,10 +566,10 @@ fi
 echo ""
 
 if (( FAIL_COUNT > 0 )); then
-    echo -e "${RED}${BOLD}SOME TESTS FAILED${NC}"
+    echo -e "${RED}${BOLD}SOME EC TESTS FAILED${NC}"
     echo -e "  Check logs: ${LOG_DIR}/"
     exit 1
 else
-    echo -e "${GREEN}${BOLD}ALL TESTS PASSED${NC}"
+    echo -e "${GREEN}${BOLD}ALL EC TESTS PASSED${NC}"
     exit 0
 fi

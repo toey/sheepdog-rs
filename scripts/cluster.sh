@@ -12,17 +12,11 @@
 set -euo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────
-BIND=127.0.0.1
-BASE_PORT=7000          # node0=7000, node1=7002, node2=7004
-HTTP_BASE_PORT=8000     # node0=8000, node1=8002, node2=8004
-NBD_PORT=10809
-NFS_PORT=2049
-NUM_NODES=3
-DATA_ROOT="/tmp/sheepdog-cluster"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/defaults.sh"
 LOG_DIR="${DATA_ROOT}/logs"
 
 # Resolve binary path (release → debug → PATH)
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 if [[ -x "${REPO_ROOT}/target/release/sheep" ]]; then
@@ -139,20 +133,21 @@ do_start() {
 
     mkdir -p "$dir0"
 
-    local extra_args=()
+    local extra_args=""
     if $enable_nbd; then
-        extra_args+=(--nbd --nbd-port "$NBD_PORT")
+        extra_args="--nbd --nbd-port $NBD_PORT"
     fi
     if $enable_nfs; then
-        extra_args+=(--nfs --nfs-port "$NFS_PORT")
+        extra_args="$extra_args --nfs --nfs-port $NFS_PORT"
     fi
 
     info "Starting node 0  (port=${port0}, http=${http0})"
+    # shellcheck disable=SC2086
     "$SHEEP" --cluster-driver sdcluster \
         -b "$BIND" -p "$port0" \
         --http-port "$http0" \
         -l info \
-        "${extra_args[@]}" \
+        $extra_args \
         "$dir0" \
         > "$log0" 2>&1 &
     echo $! > "$pid0"

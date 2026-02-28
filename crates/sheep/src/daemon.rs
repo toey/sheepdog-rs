@@ -11,6 +11,10 @@ use std::sync::Arc;
 use bitvec::prelude::*;
 use tokio::sync::{Notify, RwLock};
 
+use sheepdog_proto::defaults::{
+    DEFAULT_CACHE_SIZE_MB, DEFAULT_RECOVERY_MAX_EXEC_COUNT,
+    DEFAULT_RECOVERY_QUEUE_WORK_INTERVAL_MS,
+};
 use sheepdog_proto::node::{ClusterInfo, ClusterStatus, NodeStatus, SdNode};
 use sheepdog_proto::vdi::VdiState;
 use sheepdog_core::transport::PeerTransport;
@@ -121,7 +125,7 @@ impl SystemInfo {
             journal_dir: None,
             journal_size: 0,
             object_cache_enabled: false,
-            object_cache_size: 256,
+            object_cache_size: DEFAULT_CACHE_SIZE_MB,
             use_directio: false,
             epoch_notify: Arc::new(Notify::new()),
             shutdown_notify: Arc::new(Notify::new()),
@@ -130,8 +134,8 @@ impl SystemInfo {
             md_disks: Vec::new(),
             vdi_deleted: bitvec![u8, Msb0; 0; sheepdog_proto::constants::SD_NR_VDIS as usize],
             tracing_enabled: false,
-            recovery_max_exec_count: 1,
-            recovery_queue_work_interval: 100,
+            recovery_max_exec_count: DEFAULT_RECOVERY_MAX_EXEC_COUNT,
+            recovery_queue_work_interval: DEFAULT_RECOVERY_QUEUE_WORK_INTERVAL_MS,
             recovery_throttling: false,
         }
     }

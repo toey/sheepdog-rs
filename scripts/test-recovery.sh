@@ -20,11 +20,9 @@
 set -uo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────
-BIND=127.0.0.1
-BASE_PORT=7000
-HTTP_BASE_PORT=8000
-NBD_PORT=10809
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DATA_ROOT="/tmp/sheepdog-recovery-test"
+source "${SCRIPT_DIR}/defaults.sh"
 LOG_DIR="${DATA_ROOT}/logs"
 COPIES=2
 KEEP=false
@@ -35,9 +33,6 @@ for arg in "$@"; do
         --keep) KEEP=true ;;
     esac
 done
-
-# Resolve binaries
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 if [[ -x "${REPO_ROOT}/target/release/sheep" ]]; then
