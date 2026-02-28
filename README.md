@@ -2,7 +2,7 @@
 
 A **Rust** rewrite of [Sheepdog](https://sheepdog.github.io/sheepdog/) — distributed block storage for QEMU/KVM virtual machines.
 
-> 16,000+ lines of async Rust across 6 crates. No external cluster dependencies.
+> 16,800+ lines of async Rust across 6 crates. No external cluster dependencies.
 > Connects to QEMU via NBD — works with QEMU 6.0+ (which removed native sheepdog support).
 
 ```
@@ -20,10 +20,10 @@ A **Rust** rewrite of [Sheepdog](https://sheepdog.github.io/sheepdog/) — distr
    +-----+-----+-----+-----+-----+----+
          |                 |
     Consistent Hash    4 MB Objects
-      (vnodes)         (replicated)
+      (vnodes)       (replicated / EC)
 ```
 
-Virtual disk images (VDIs) are split into **4 MB objects** and distributed across **sheep** daemons using consistent hashing. Each object is replicated to N nodes (configurable). No single point of failure — any sheep can serve any request by forwarding to the responsible peer.
+Virtual disk images (VDIs) are split into **4 MB objects** and distributed across **sheep** daemons using consistent hashing. Each object is either replicated to N nodes or erasure-coded (Reed-Solomon) for storage efficiency. No single point of failure — any sheep can serve any request by forwarding to the responsible peer.
 
 ---
 
@@ -37,11 +37,11 @@ cargo build --release
 
 Produces three binaries in `target/release/`:
 
-| Binary | Size | Description |
-|--------|------|-------------|
-| `sheep` | 4.5 MB | Storage daemon |
-| `dog` | 3.0 MB | CLI admin tool |
-| `shepherd` | 2.4 MB | Cluster monitor |
+| Binary | Description |
+|--------|-------------|
+| `sheep` | Storage daemon |
+| `dog` | CLI admin tool |
+| `shepherd` | Cluster monitor |
 
 Requirements: **Rust 1.70+**, Linux/macOS/FreeBSD.
 
@@ -100,25 +100,84 @@ dog -a 10.0.0.1 cluster format --copies 3
 dog -a 10.0.0.1 node list
 ```
 
-### 5. Localhost test cluster
+### 5. Cluster script (localhost)
+
+A convenience script is included for local development:
 
 ```bash
-# 3 nodes on different ports
-sheep --cluster-driver sdcluster -b 127.0.0.1 -p 7000 \
-      --nbd --http-port 8000 /tmp/sheep/n0
+# Start 3-node cluster with NBD
+scripts/cluster.sh start --nbd --format
 
-sheep --cluster-driver sdcluster -b 127.0.0.1 -p 7002 \
-      --seed 127.0.0.1:7000 --http-port 8002 /tmp/sheep/n1
+# Check status
+scripts/cluster.sh status
 
-sheep --cluster-driver sdcluster -b 127.0.0.1 -p 7004 \
-      --seed 127.0.0.1:7000 --http-port 8004 /tmp/sheep/n2
+# Stop all nodes
+scripts/cluster.sh stop
 
-dog node list
-# Id | Host      | Port | VNodes | Zone | Status
-#  0 | 127.0.0.1 | 7000 |  128   |  0   | alive
-#  1 | 127.0.0.1 | 7002 |  128   |  0   | alive
-#  2 | 127.0.0.1 | 7004 |  128   |  0   | alive
+# Full cleanup (remove data directories)
+scripts/cluster.sh clean
 ```
+
+Options: `--nbd`, `--nfs`, `--format`, `--copies N`, `--http`.
+
+---
+
+## Erasure Coding
+
+Sheepdog-rs supports **Reed-Solomon erasure coding** as an alternative to simple replication. EC splits each 4 MB object into D data strips and P parity strips — recovering data even if any P strips are lost.
+
+### Create an EC VDI
+
+```bash
+# Erasure coded 2+1 (2 data strips + 1 parity strip, needs ≥3 nodes)
+dog vdi create myvdi 20G --copy-policy 2:1
+
+# Erasure coded 4+2 (4 data + 2 parity, needs ≥6 nodes)
+dog vdi create myvdi 100G --copy-policy 4:2
+
+# Standard replication (default)
+dog vdi create myvdi 20G --copies 3
+```
+
+### How it works
+
+```
+  4 MB Object
+  ┌──────────────────┐
+  │     data         │
+  └──────┬───────────┘
+         │ split into D strips
+         ▼
+  ┌──────┬──────┐
+  │ D₁   │ D₂   │  (data strips)
+  └──┬───┴──┬───┘
+     │ Reed-Solomon encode
+     ▼
+  ┌──────┬──────┬──────┐
+  │ D₁   │ D₂   │ P₁   │  (D + P strips)
+  └──┬───┴──┬───┴──┬───┘
+     │      │      │
+  node-A  node-B  node-C
+```
+
+**Write path**: Object → split into D strips → RS encode to D+P strips → distribute to D+P nodes via hash ring.
+
+**Read path**: Read D strips from nodes → if any are missing, fetch parity → RS reconstruct → reassemble.
+
+**Partial write**: Read full object (reconstruct from strips) → apply update at offset → re-encode → redistribute all strips.
+
+### Policy byte format
+
+The copy policy is encoded as a single byte: `(D << 4) | P`.
+
+| Policy | D:P | Total strips | Storage overhead |
+|--------|-----|:------------:|:----------------:|
+| `0x21` | 2:1 | 3 | 1.5× |
+| `0x41` | 4:1 | 5 | 1.25× |
+| `0x42` | 4:2 | 6 | 1.5× |
+| `0x12` | 1:2 | 3 | 3× |
+
+Compare with replication: 3-copy replication = 3× overhead. EC 4:2 gives the same fault tolerance with only 1.5× overhead.
 
 ---
 
@@ -127,12 +186,14 @@ dog node list
 ```
 sheepdog-rs/
 ├── crates/
-│   ├── sheepdog-proto/   1,457 LOC   Wire protocol, types, constants
-│   ├── sheepdog-core/      414 LOC   Consistent hashing, erasure coding
-│   ├── sheep/           10,945 LOC   Storage daemon
-│   ├── dog/              2,679 LOC   CLI admin tool
+│   ├── sheepdog-proto/   1,462 LOC   Wire protocol, types, constants
+│   ├── sheepdog-core/      406 LOC   Consistent hashing, erasure coding
+│   ├── sheep/           11,326 LOC   Storage daemon
+│   ├── dog/              2,728 LOC   CLI admin tool
 │   ├── shepherd/           344 LOC   Cluster monitor
 │   └── sheepfs/            554 LOC   FUSE filesystem (optional)
+├── scripts/
+│   └── cluster.sh          353 LOC   3-node cluster management
 └── Cargo.toml                        Workspace root (v0.10.0)
 ```
 
@@ -151,12 +212,12 @@ Wire types shared by all components:
 ### sheepdog-core — Core Library
 
 - **Consistent hashing** — Virtual node ring with zone-aware placement
-- **Erasure coding** — Reed-Solomon via `reed-solomon-erasure`
+- **Erasure coding** — Reed-Solomon via `reed-solomon-erasure` (encode, reconstruct, ec_policy_to_dp)
 - **Networking** — Async TCP helpers, socket FD caching
 
 ### sheep — Storage Daemon
 
-The main daemon. Handles object I/O, replication, recovery, and exposes multiple server interfaces.
+The main daemon. Handles object I/O, replication, erasure coding, recovery, and exposes multiple server interfaces.
 
 ```
 sheep startup
@@ -177,6 +238,8 @@ sheep startup
 ```
 Client TCP → read_request() → dispatch(SdRequest)
                                  ├── Gateway  → forward via hash ring
+                                 │              ├── replicated write/read
+                                 │              └── EC write/read (RS encode/decode)
                                  ├── Peer     → local object I/O
                                  ├── Cluster  → VDI create/delete, format
                                  └── Local    → node info, stat queries
@@ -188,10 +251,11 @@ Client TCP → read_request() → dispatch(SdRequest)
 |--------|------:|---------|
 | `cluster/sdcluster.rs` | 1,293 | P2P TCP mesh driver |
 | `nbd/mod.rs` | 844 | NBD export server |
+| `ops/gateway.rs` | 667 | Gateway I/O (replication + EC) |
 | `recovery.rs` | 662 | Background object migration |
 | `store/md.rs` | 568 | Multi-disk storage backend |
 | `object_cache.rs` | 542 | LRU object cache |
-| `ops/peer.rs` | 443 | Peer-to-peer I/O |
+| `ops/peer.rs` | 450 | Peer-to-peer I/O |
 | `ops/cluster.rs` | 440 | Cluster-wide operations |
 | `journal.rs` | 440 | Write-ahead journal |
 | `nfs/*.rs` | 1,139 | NFS v3 server (ONC RPC) |
@@ -216,16 +280,17 @@ Commands:
 **VDI commands:**
 
 ```bash
-dog vdi create <name> <size>        # Create VDI
-dog vdi delete <name>               # Delete VDI
-dog vdi list                        # List all VDIs
-dog vdi snapshot <name> -s <tag>    # Take snapshot
-dog vdi clone <src> <dst>           # Clone VDI
-dog vdi resize <name> <size>        # Resize VDI
-dog vdi object <name>               # Show object map
-dog vdi tree                        # Show snapshot/clone tree
-dog vdi lock list                   # Show locks
-dog vdi lock unlock <name>          # Force unlock
+dog vdi create <name> <size>                  # Create VDI (replicated)
+dog vdi create <name> <size> --copy-policy 2:1  # Create VDI (EC 2+1)
+dog vdi delete <name>                         # Delete VDI
+dog vdi list                                  # List all VDIs
+dog vdi snapshot <name> -s <tag>              # Take snapshot
+dog vdi clone <src> <dst>                     # Clone VDI
+dog vdi resize <name> <size>                  # Resize VDI
+dog vdi object <name>                         # Show object map
+dog vdi tree                                  # Show snapshot/clone tree
+dog vdi lock list                             # Show locks
+dog vdi lock unlock <name>                    # Force unlock
 ```
 
 **Cluster commands:**
@@ -370,6 +435,18 @@ Each sheepdog object has a 64-bit **Object ID**:
 | `tree` | `obj/{vid_hex}/{oid_hex}` | Better for many VDIs |
 | `md` | Balanced across multiple disks | Production |
 
+### EC Strip Storage
+
+When erasure coding is active, each strip is stored with an `_N` suffix on the target node:
+
+```
+node-A/obj/00ab000100000000_1   ← data strip 1
+node-B/obj/00ab000100000000_2   ← data strip 2
+node-C/obj/00ab000100000000_3   ← parity strip 1
+```
+
+Standard replicated objects have no suffix (just the hex OID).
+
 ### Caching & Journaling
 
 - **Object cache**: LRU eviction, backed by `dashmap` + `lru` crate
@@ -443,6 +520,7 @@ mount -t nfs -o port=2049,mountport=2050,nfsvers=3,tcp localhost:/ /mnt/sheep
 | `SD_MAX_NODES` | 6,144 |
 | `SD_NR_VDIS` | 16,777,216 |
 | `SD_DEFAULT_VNODES` | 128 |
+| `SD_EC_MAX_STRIP` | 16 |
 | `HEARTBEAT_INTERVAL` | 5 s |
 | `HEARTBEAT_TIMEOUT` | 15 s |
 
@@ -476,12 +554,13 @@ cargo build -p sheepfs
 | | C Sheepdog (v0.9.5) | sheepdog-rs (v0.10.0) |
 |-|---------------------|----------------------|
 | Language | C | Rust (async, memory-safe) |
-| Codebase | ~60K LOC | ~16K LOC |
+| Codebase | ~60K LOC | ~16.8K LOC |
 | Async I/O | epoll + callbacks | tokio async/await |
 | Cluster | Corosync / ZooKeeper | Built-in P2P TCP mesh |
 | External deps | corosync, libcpg | None |
 | Serialization | Hand-packed structs | bincode + serde |
 | HTTP server | Custom parser | axum |
+| Erasure coding | C library (jerasure) | reed-solomon-erasure (pure Rust) |
 | QEMU attach | Native block driver | NBD export server |
 
 ---
@@ -517,6 +596,7 @@ cargo build -p sheepfs
 | Storage backends (plain, tree, md) | Done |
 | Client request pipeline | Done |
 | Object replication | Done |
+| Erasure coding (Reed-Solomon) | Done |
 | Recovery worker | Done |
 | Object cache + journal | Done |
 | HTTP/S3 API | Done |
@@ -526,7 +606,6 @@ cargo build -p sheepfs
 | CLI tool (dog) | Done |
 | FUSE filesystem (sheepfs) | Done |
 | Cluster monitor (shepherd) | Done |
-| Erasure coding | Partial |
 
 ---
 

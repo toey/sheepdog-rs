@@ -21,6 +21,25 @@ use crate::common::{
 // CLI argument types
 // ---------------------------------------------------------------------------
 
+/// Parse a copy policy from "D:P" (e.g. "2:1") or decimal number.
+fn parse_copy_policy(s: &str) -> Result<u8, String> {
+    // "0" or plain decimal
+    if !s.contains(':') {
+        return s.parse::<u8>().map_err(|e| e.to_string());
+    }
+    // "D:P" format
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 2 {
+        return Err("expected format D:P (e.g. 2:1)".to_string());
+    }
+    let d: u8 = parts[0].parse().map_err(|_| "invalid data strip count")?;
+    let p: u8 = parts[1].parse().map_err(|_| "invalid parity strip count")?;
+    if d == 0 || d > 15 || p == 0 || p > 15 {
+        return Err("D and P must be 1..15".to_string());
+    }
+    Ok((d << 4) | p)
+}
+
 #[derive(Args)]
 pub struct VdiArgs {
     #[command(subcommand)]
@@ -38,6 +57,9 @@ pub enum VdiCommands {
         /// Number of copies (default: cluster default)
         #[arg(short = 'c', long)]
         copies: Option<u8>,
+        /// Erasure coding policy: "D:P" for D data + P parity strips (e.g. "2:1"). 0 = replication.
+        #[arg(long, default_value = "0", value_parser = parse_copy_policy)]
+        copy_policy: u8,
         /// Pre-allocate all data objects
         #[arg(short = 'P', long)]
         prealloc: bool,
@@ -193,9 +215,10 @@ pub async fn run(addr: &str, port: u16, args: VdiArgs) {
             name,
             size,
             copies,
+            copy_policy,
             prealloc: _,
         } => {
-            vdi_create(addr, port, &name, &size, copies).await;
+            vdi_create(addr, port, &name, &size, copies, copy_policy).await;
         }
         VdiCommands::Delete { name, snapshot } => {
             vdi_delete(addr, port, &name, snapshot.as_deref()).await;
@@ -251,7 +274,14 @@ pub async fn run(addr: &str, port: u16, args: VdiArgs) {
 // VDI create
 // ---------------------------------------------------------------------------
 
-async fn vdi_create(addr: &str, port: u16, name: &str, size_str: &str, copies: Option<u8>) {
+async fn vdi_create(
+    addr: &str,
+    port: u16,
+    name: &str,
+    size_str: &str,
+    copies: Option<u8>,
+    copy_policy: u8,
+) {
     let vdi_size = match parse_size(size_str) {
         Ok(s) => s,
         Err(e) => exit_error(&format!("Invalid size: {}", e)),
@@ -274,7 +304,16 @@ async fn vdi_create(addr: &str, port: u16, name: &str, size_str: &str, copies: O
         ));
     }
 
-    let nr_copies = copies.unwrap_or(SD_DEFAULT_COPIES);
+    // For erasure coding, nr_copies = data_strips + parity_strips
+    let nr_copies = if copy_policy != 0 {
+        let (d, p) = sheepdog_core::fec::ec_policy_to_dp(copy_policy);
+        if d == 0 || p == 0 {
+            exit_error("Invalid copy_policy: both data and parity must be > 0");
+        }
+        (d + p) as u8
+    } else {
+        copies.unwrap_or(SD_DEFAULT_COPIES)
+    };
 
     let mut stream = match connect_to_sheep(addr, port).await {
         Ok(s) => s,
@@ -286,7 +325,7 @@ async fn vdi_create(addr: &str, port: u16, name: &str, size_str: &str, copies: O
         vdi_size,
         base_vid: 0,
         copies: nr_copies,
-        copy_policy: 0,
+        copy_policy,
         store_policy: 0,
         snap_id: 0,
         vdi_type: 0,
@@ -294,13 +333,23 @@ async fn vdi_create(addr: &str, port: u16, name: &str, size_str: &str, copies: O
 
     match send_request_ok(&mut stream, req).await {
         Ok(ResponseResult::Vdi { vdi_id, copies, .. }) => {
-            print_success(&format!(
-                "VDI '{}' created (id: {:#x}, size: {}, copies: {})",
-                name,
-                vdi_id,
-                format_size(vdi_size),
-                copies
-            ));
+            if copy_policy != 0 {
+                let (d, p) = sheepdog_core::fec::ec_policy_to_dp(copy_policy);
+                print_success(&format!(
+                    "VDI '{}' created (id: {:#x}, size: {}, EC {d}+{p})",
+                    name,
+                    vdi_id,
+                    format_size(vdi_size),
+                ));
+            } else {
+                print_success(&format!(
+                    "VDI '{}' created (id: {:#x}, size: {}, copies: {})",
+                    name,
+                    vdi_id,
+                    format_size(vdi_size),
+                    copies
+                ));
+            }
         }
         Ok(_) => {
             print_success(&format!(

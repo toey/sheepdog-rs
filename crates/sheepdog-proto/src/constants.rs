@@ -74,3 +74,8 @@ pub const SD_CLUSTER_FLAG_USE_LOCK: u16 = 0x0008;
 /// Lock types for VDI operations
 pub const LOCK_TYPE_NORMAL: u32 = 0;
 pub const LOCK_TYPE_SHARED: u32 = 1;
+
+/// Erasure coding: maximum strips per side (data or parity)
+pub const SD_EC_MAX_STRIP: usize = 16;
+/// Erasure coding: data stripe size in bytes (for striping within an object)
+pub const SD_EC_DATA_STRIPE_SIZE: usize = 512;

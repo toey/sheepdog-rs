@@ -1,9 +1,8 @@
 //! Consistent hashing with virtual nodes (vnodes) for data placement.
 
-use sheepdog_proto::hash::sd_hash_next;
+use sheepdog_proto::hash::{sd_hash_next, sd_hash_oid};
 use sheepdog_proto::node::SdNode;
 use sheepdog_proto::oid::ObjectId;
-use sheepdog_proto::hash::sd_hash_oid;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -40,16 +39,9 @@ impl VNodeInfo {
             node_map.insert(nid_str.clone(), arc_node.clone());
             zones.insert(node.zone);
 
-            // Generate virtual nodes
-            let mut hash = sd_hash_oid(
-                u64::from_ne_bytes({
-                    let mut buf = [0u8; 8];
-                    let addr_bytes = nid_str.as_bytes();
-                    let copy_len = addr_bytes.len().min(8);
-                    buf[..copy_len].copy_from_slice(&addr_bytes[..copy_len]);
-                    buf
-                }),
-            );
+            // Generate virtual nodes — hash the full node ID string
+            // to avoid collisions when nodes share an IP prefix (e.g. localhost).
+            let mut hash = sheepdog_proto::hash::sd_hash(nid_str.as_bytes());
 
             for _ in 0..node.nr_vnodes {
                 vnodes.insert(hash, arc_node.clone());

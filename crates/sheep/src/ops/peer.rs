@@ -135,11 +135,18 @@ async fn read(
     let data = tokio::task::spawn_blocking(move || {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = std::fs::File::open(&path).map_err(|_| SdError::NoObj)?;
-        file.seek(SeekFrom::Start(offset as u64))
-            .map_err(|_| SdError::Eio)?;
-        let mut buf = vec![0u8; length as usize];
-        file.read_exact(&mut buf).map_err(|_| SdError::Eio)?;
-        Ok::<_, SdError>(buf)
+        if length == 0 {
+            // Read entire file
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf).map_err(|_| SdError::Eio)?;
+            Ok::<_, SdError>(buf)
+        } else {
+            file.seek(SeekFrom::Start(offset as u64))
+                .map_err(|_| SdError::Eio)?;
+            let mut buf = vec![0u8; length as usize];
+            file.read_exact(&mut buf).map_err(|_| SdError::Eio)?;
+            Ok::<_, SdError>(buf)
+        }
     })
     .await
     .map_err(|_| SdError::SystemError)??;

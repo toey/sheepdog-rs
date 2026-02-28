@@ -127,16 +127,26 @@ async fn handle_client(sys: SharedSys, mut stream: TcpStream) -> SdResult<()> {
 }
 
 /// Check request epoch against cluster epoch.
+///
+/// We allow requests from newer epochs (the sender may have processed
+/// more cluster events than us). Only reject requests from significantly
+/// older epochs, which indicates a stale sender.
 async fn check_epoch(sys: &SharedSys, header: &RequestHeader) -> SdResult<()> {
     let s = sys.read().await;
     let cluster_epoch = s.epoch();
 
-    if header.epoch > 0 && header.epoch < cluster_epoch {
+    // Epoch 0 = skip check (internal/local requests)
+    if header.epoch == 0 {
+        return Ok(());
+    }
+
+    // Reject requests from epochs that are too old
+    if header.epoch > 0 && header.epoch + 100 < cluster_epoch {
         return Err(SdError::OldNodeVer);
     }
-    if header.epoch > cluster_epoch {
-        return Err(SdError::NewNodeVer);
-    }
+
+    // Allow requests from newer epochs — the sender knows about
+    // cluster events we haven't processed yet. We'll catch up.
     Ok(())
 }
 
@@ -193,6 +203,15 @@ fn is_force_op(req: &SdRequest) -> bool {
             | SdRequest::StatCluster
             | SdRequest::StatSheep
             | SdRequest::GetStoreList
+            // Peer I/O always allowed — the sending node has already
+            // verified cluster status; we just store/retrieve data.
+            | SdRequest::CreateAndWritePeer { .. }
+            | SdRequest::ReadPeer { .. }
+            | SdRequest::WritePeer { .. }
+            | SdRequest::RemovePeer { .. }
+            | SdRequest::FlushPeer
+            | SdRequest::Exist { .. }
+            | SdRequest::GetObjList { .. }
     )
 }
 
