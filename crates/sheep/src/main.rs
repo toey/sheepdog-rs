@@ -36,11 +36,12 @@ use std::sync::Arc;
 
 use clap::Parser;
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use sheepdog_proto::constants::SD_LISTEN_PORT;
 use sheepdog_proto::node::{NodeId, SdNode};
 
+use crate::cluster::{ClusterDriver, ClusterEvent};
 use crate::daemon::SystemInfo;
 
 /// Sheepdog storage daemon
@@ -114,6 +115,19 @@ struct Args {
     /// NFS MOUNT port (default: 2050)
     #[arg(long, default_value_t = 2050)]
     nfs_mount_port: u16,
+
+    /// Cluster driver to use: "local" (single-node) or "sdcluster" (P2P TCP mesh)
+    #[arg(long, default_value = "local")]
+    cluster_driver: String,
+
+    /// Seed node addresses for joining an existing cluster (sdcluster driver only).
+    /// Format: host:port, can be specified multiple times.
+    #[arg(long = "seed", value_name = "HOST:PORT")]
+    seeds: Vec<String>,
+
+    /// Cluster communication port offset from listen port (sdcluster driver only)
+    #[arg(long, default_value_t = 1)]
+    cluster_port_offset: u16,
 }
 
 #[tokio::main]
@@ -186,16 +200,83 @@ async fn main() {
 
     let sys = Arc::new(RwLock::new(sys_info));
 
-    // Add ourselves to the cluster
+    // ---------------------------------------------------------------
+    // Create cluster driver
+    // ---------------------------------------------------------------
+    let cluster_driver: Arc<dyn ClusterDriver> = match args.cluster_driver.as_str() {
+        "sdcluster" => {
+            // Parse seed addresses
+            let seed_addrs: Vec<SocketAddr> = args
+                .seeds
+                .iter()
+                .filter_map(|s| {
+                    match s.parse::<SocketAddr>() {
+                        Ok(addr) => {
+                            // Seeds connect on cluster port = port + offset
+                            let cluster_addr = SocketAddr::new(
+                                addr.ip(),
+                                addr.port() + args.cluster_port_offset,
+                            );
+                            Some(cluster_addr)
+                        }
+                        Err(e) => {
+                            error!("invalid seed address '{}': {}", s, e);
+                            None
+                        }
+                    }
+                })
+                .collect();
+
+            info!(
+                "using sdcluster driver with {} seed(s), port offset {}",
+                seed_addrs.len(),
+                args.cluster_port_offset
+            );
+
+            let driver = cluster::sdcluster::SdClusterDriverBuilder::new()
+                .seeds(seed_addrs)
+                .port_offset(args.cluster_port_offset)
+                .build()
+                .await;
+            Arc::new(driver)
+        }
+        "local" | _ => {
+            if args.cluster_driver != "local" {
+                warn!(
+                    "unknown cluster driver '{}', falling back to 'local'",
+                    args.cluster_driver
+                );
+            }
+            info!("using local cluster driver (single-node mode)");
+            Arc::new(cluster::local::LocalDriver::new(listen_addr))
+        }
+    };
+
+    // Initialize and join the cluster via the driver
     {
         let s = sys.read().await;
         let this = s.this_node.clone();
         drop(s);
-        if let Err(e) = group::handle_node_join(sys.clone(), this).await {
+
+        if let Err(e) = cluster_driver.init(&this).await {
+            error!("cluster driver init failed: {}", e);
+            std::process::exit(1);
+        }
+
+        if let Err(e) = cluster_driver.join(&this).await {
             error!("failed to join cluster: {}", e);
             std::process::exit(1);
         }
     }
+
+    // ---------------------------------------------------------------
+    // Spawn cluster event loop
+    // ---------------------------------------------------------------
+    let sys_cluster = sys.clone();
+    let driver_for_loop = cluster_driver.clone();
+    tokio::spawn(async move {
+        cluster_event_loop(sys_cluster, driver_for_loop).await;
+    });
 
     info!("sheep ready on {}", listen_addr);
 
@@ -248,8 +329,16 @@ async fn main() {
         }
     }
 
+    // ---------------------------------------------------------------
     // Graceful shutdown
+    // ---------------------------------------------------------------
     info!("sheep shutting down");
+
+    // Leave the cluster gracefully
+    if let Err(e) = cluster_driver.leave().await {
+        warn!("cluster leave failed: {}", e);
+    }
+
     {
         let s = sys.read().await;
         s.shutdown_notify.notify_waiters();
@@ -264,4 +353,146 @@ async fn main() {
     }
 
     info!("sheep stopped");
+}
+
+/// Cluster event processing loop.
+///
+/// Receives events from the cluster driver and dispatches them to the
+/// group membership layer, triggering epoch bumps and recovery as needed.
+async fn cluster_event_loop(sys: Arc<RwLock<SystemInfo>>, driver: Arc<dyn ClusterDriver>) {
+    info!("cluster event loop started (driver={})", driver.name());
+
+    loop {
+        let event = match driver.recv_event().await {
+            Ok(ev) => ev,
+            Err(e) => {
+                // Channel closed or driver shut down
+                info!("cluster event loop ending: {}", e);
+                break;
+            }
+        };
+
+        match event {
+            ClusterEvent::Join(node) => {
+                info!("cluster event: node {} joined", node.nid);
+                if let Err(e) = group::handle_node_join(sys.clone(), node).await {
+                    error!("failed to handle node join: {}", e);
+                }
+            }
+            ClusterEvent::Leave(node) => {
+                info!("cluster event: node {} left", node.nid);
+                if let Err(e) = group::handle_node_leave(sys.clone(), &node).await {
+                    error!("failed to handle node leave: {}", e);
+                }
+            }
+            ClusterEvent::Notify(data) => {
+                info!("cluster event: notify ({} bytes)", data.len());
+                // Notifications can carry cluster-wide commands (e.g. format,
+                // alter-copy). Decode and dispatch as needed.
+                handle_cluster_notify(sys.clone(), &data).await;
+            }
+            ClusterEvent::Block => {
+                info!("cluster event: block (two-phase update phase 1)");
+                // The cluster is entering a blocking state. Pause new
+                // requests that depend on stable cluster state.
+            }
+            ClusterEvent::Unblock(data) => {
+                info!("cluster event: unblock ({} bytes)", data.len());
+                // The two-phase update is complete. Resume normal operation.
+                handle_cluster_notify(sys.clone(), &data).await;
+            }
+        }
+    }
+}
+
+/// Handle a cluster-wide notification payload.
+///
+/// Notifications carry serialized commands like cluster format, alter-copy,
+/// shutdown, etc. This function decodes and applies them.
+async fn handle_cluster_notify(sys: Arc<RwLock<SystemInfo>>, data: &[u8]) {
+    use sheepdog_proto::node::ClusterStatus;
+
+    // Try to decode as a ClusterNotify message
+    #[derive(serde::Deserialize)]
+    enum ClusterNotify {
+        Format {
+            nr_copies: u8,
+            copy_policy: u8,
+            flags: u16,
+            store: String,
+            ctime: u64,
+        },
+        Shutdown,
+        AlterCopy {
+            nr_copies: u8,
+            copy_policy: u8,
+        },
+        DisableRecovery,
+        EnableRecovery,
+    }
+
+    let notify: ClusterNotify = match bincode::deserialize(data) {
+        Ok(n) => n,
+        Err(_) => {
+            // Not a recognized notification format; ignore silently
+            return;
+        }
+    };
+
+    match notify {
+        ClusterNotify::Format {
+            nr_copies,
+            copy_policy,
+            flags,
+            store,
+            ctime,
+        } => {
+            let mut s = sys.write().await;
+            s.cinfo.nr_copies = nr_copies;
+            s.cinfo.copy_policy = copy_policy;
+            s.cinfo.flags = flags;
+            s.cinfo.default_store = store;
+            s.cinfo.ctime = ctime;
+            s.cinfo.status = ClusterStatus::Ok;
+            let dir = s.dir.clone();
+            let cinfo = s.cinfo.clone();
+            drop(s);
+
+            info!(
+                "cluster formatted: copies={}, policy={}, flags={:#x}",
+                nr_copies, copy_policy, flags
+            );
+
+            if let Err(e) = config::save_config(&dir, &cinfo).await {
+                error!("failed to save config after format: {}", e);
+            }
+        }
+        ClusterNotify::Shutdown => {
+            info!("cluster shutdown notification received");
+            let s = sys.read().await;
+            s.shutdown_notify.notify_waiters();
+        }
+        ClusterNotify::AlterCopy {
+            nr_copies,
+            copy_policy,
+        } => {
+            let mut s = sys.write().await;
+            s.cinfo.nr_copies = nr_copies;
+            s.cinfo.copy_policy = copy_policy;
+            info!(
+                "cluster config updated: copies={}, policy={}",
+                nr_copies, copy_policy
+            );
+        }
+        ClusterNotify::DisableRecovery => {
+            let mut s = sys.write().await;
+            s.disable_recovery = true;
+            info!("cluster recovery disabled");
+        }
+        ClusterNotify::EnableRecovery => {
+            let mut s = sys.write().await;
+            s.disable_recovery = false;
+            info!("cluster recovery enabled");
+        }
+    }
 }
