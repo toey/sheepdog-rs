@@ -1,0 +1,20 @@
+[package]
+name = "shepherd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sheepdog distributed storage - cluster coordination daemon"
+
+[[bin]]
+name = "shepherd"
+path = "src/main.rs"
+
+[dependencies]
+sheepdog-proto = { workspace = true }
+sheepdog-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }

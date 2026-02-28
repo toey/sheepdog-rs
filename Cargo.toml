@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sheepdog-proto",
+    "crates/sheepdog-core",
+    "crates/sheep",
+    "crates/dog",
+    "crates/sheepfs",
+    "crates/shepherd",
+]
+# Exclude sheepfs from default build (requires system libfuse)
+default-members = [
+    "crates/sheepdog-proto",
+    "crates/sheepdog-core",
+    "crates/sheep",
+    "crates/dog",
+    "crates/shepherd",
+]
+
+[workspace.package]
+version = "0.10.0"
+edition = "2021"
+license = "GPL-2.0"
+repository = "https://github.com/sheepdog/sheepdog-rs"
+
+[workspace.dependencies]
+sheepdog-proto = { path = "crates/sheepdog-proto" }
+sheepdog-core = { path = "crates/sheepdog-core" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+bytes = "1"
+dashmap = "6"
+sha1 = "0.10"

@@ -1,0 +1,22 @@
+[package]
+name = "dog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sheepdog distributed storage - CLI admin tool"
+
+[[bin]]
+name = "dog"
+path = "src/main.rs"
+
+[dependencies]
+sheepdog-proto = { workspace = true }
+sheepdog-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+tabled = "0.16"
+indicatif = "0.17"

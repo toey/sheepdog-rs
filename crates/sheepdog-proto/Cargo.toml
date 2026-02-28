@@ -1,0 +1,11 @@
+[package]
+name = "sheepdog-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sheepdog distributed storage - protocol types and constants"
+
+[dependencies]
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }

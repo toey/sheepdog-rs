@@ -1,0 +1,44 @@
+[package]
+name = "sheep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sheepdog distributed storage daemon"
+
+[[bin]]
+name = "sheep"
+path = "src/main.rs"
+
+[dependencies]
+sheepdog-proto = { workspace = true }
+sheepdog-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+bincode = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+sha1 = { workspace = true }
+nix = { version = "0.29", features = ["fs", "mman", "signal"] }
+memmap2 = "0.9"
+bitvec = "1"
+lru = "0.7"
+rand = "0.8"
+
+[features]
+default = ["http"]
+http = ["dep:axum", "dep:hyper"]
+nfs = []
+
+[dependencies.axum]
+version = "0.7"
+optional = true
+
+[dependencies.hyper]
+version = "1"
+features = ["http1", "server"]
+optional = true
