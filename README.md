@@ -2,8 +2,9 @@
 
 A **Rust** rewrite of [Sheepdog](https://sheepdog.github.io/sheepdog/) — distributed block storage for QEMU/KVM virtual machines.
 
-> 16,800+ lines of async Rust across 6 crates. No external cluster dependencies.
+> 17,500+ lines of async Rust across 7 crates. No external cluster dependencies.
 > Connects to QEMU via NBD — works with QEMU 6.0+ (which removed native sheepdog support).
+> Optional DPDK data plane for kernel-bypass peer I/O.
 
 ```
                QEMU / qemu-img                    dog CLI
@@ -181,16 +182,84 @@ Compare with replication: 3-copy replication = 3× overhead. EC 4:2 gives the sa
 
 ---
 
+## DPDK Data Plane (Optional)
+
+Sheepdog-rs supports **DPDK** (Data Plane Development Kit) for kernel-bypass peer-to-peer I/O. DPDK replaces kernel TCP with user-space UDP on a dedicated NIC, significantly reducing latency and increasing throughput for the data path.
+
+The control plane (cluster mesh, dog CLI, HTTP, NFS, NBD) stays on kernel TCP. Only peer data I/O (gateway forwarding, recovery fetch, replica repair) uses the DPDK transport.
+
+### Architecture
+
+```
+  Control plane (TCP, kernel)          Data plane (UDP, DPDK)
+  ────────────────────────────         ──────────────────────────
+  Client → sheep:7000 (gateway)        sheep ←→ sheep via :7100
+  dog → sheep:7000 (CLI)               rte_eth_rx/tx_burst()
+  sheep ←→ sheep:7001 (cluster mesh)   Poll-mode driver (PMD)
+  NBD :10809, NFS :2049, HTTP :8000    Dedicated CPU core
+```
+
+### Build with DPDK
+
+```bash
+# Requires DPDK installed (pkg-config --libs libdpdk must work)
+cargo build -p sheep --features dpdk
+
+# Without DPDK (default) — pure TCP, no system deps
+cargo build -p sheep
+```
+
+### Usage
+
+```bash
+sheep --dpdk \
+      --dpdk-addr 10.0.0.1 \
+      --dpdk-port 7100 \
+      --dpdk-eal-args "-l 0-3 -n 4 --file-prefix sheep" \
+      --dpdk-ports 0 \
+      --dpdk-queues 1 \
+      /data/sheep
+```
+
+Each node advertises its DPDK address (`io_addr` + `io_port`) so peers route data I/O through the DPDK NIC. Nodes without DPDK communicate via TCP transparently.
+
+### Packet Format
+
+```
+  Ethernet | IP | UDP | DpdkPeerHeader (16 bytes) | Payload
+                        ├── request_id   (u64)
+                        ├── flags        (u16)  FIRST/LAST/RESPONSE/SINGLE
+                        ├── frag_index   (u16)
+                        ├── total_frags  (u16)
+                        └── payload_len  (u16)
+```
+
+Large messages (e.g., 4 MB objects) are fragmented into ~8 KB UDP datagrams and reassembled by the receiver.
+
+### CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dpdk` | off | Enable DPDK data plane |
+| `--dpdk-addr` | (required) | IP address for DPDK NIC |
+| `--dpdk-port` | 7100 | UDP port for data plane |
+| `--dpdk-eal-args` | "" | DPDK EAL init arguments |
+| `--dpdk-ports` | "0" | DPDK port IDs (comma-separated) |
+| `--dpdk-queues` | 1 | RX/TX queues per port |
+
+---
+
 ## Workspace
 
 ```
 sheepdog-rs/
 ├── crates/
 │   ├── sheepdog-proto/   1,462 LOC   Wire protocol, types, constants
-│   ├── sheepdog-core/      406 LOC   Consistent hashing, erasure coding
-│   ├── sheep/           11,326 LOC   Storage daemon
+│   ├── sheepdog-core/      650 LOC   Consistent hashing, EC, transport traits
+│   ├── sheep/           11,500 LOC   Storage daemon
 │   ├── dog/              2,728 LOC   CLI admin tool
 │   ├── shepherd/           344 LOC   Cluster monitor
+│   ├── sheepdog-dpdk/      560 LOC   DPDK data plane (optional)
 │   └── sheepfs/            554 LOC   FUSE filesystem (optional)
 ├── scripts/
 │   └── cluster.sh          353 LOC   3-node cluster management
@@ -214,6 +283,8 @@ Wire types shared by all components:
 - **Consistent hashing** — Virtual node ring with zone-aware placement
 - **Erasure coding** — Reed-Solomon via `reed-solomon-erasure` (encode, reconstruct, ec_policy_to_dp)
 - **Networking** — Async TCP helpers, socket FD caching
+- **Transport abstraction** — `PeerTransport` / `PeerListener` / `PeerResponder` traits for pluggable data plane (TCP or DPDK)
+- **TcpTransport** — Default transport using kernel TCP with connection pooling (`SockfdCache`)
 
 ### sheep — Storage Daemon
 
@@ -362,6 +433,12 @@ Options:
   -l, --log-level <LEVEL>     Log level [default: info]
       --cluster-driver <DRV>  local | sdcluster [default: local]
       --seed <HOST:PORT>      Seed node (repeatable)
+      --dpdk                  Enable DPDK data plane
+      --dpdk-addr <IP>        DPDK NIC address (required with --dpdk)
+      --dpdk-port <PORT>      DPDK UDP port [default: 7100]
+      --dpdk-eal-args <ARGS>  DPDK EAL arguments
+      --dpdk-ports <IDS>      DPDK port IDs [default: 0]
+      --dpdk-queues <N>       RX/TX queues [default: 1]
 ```
 
 ---
@@ -503,6 +580,7 @@ mount -t nfs -o port=2049,mountport=2050,nfsvers=3,tcp localhost:/ /mnt/sheep
 |----------|----------|---------------|:------------:|
 | Client I/O | bincode | 4-byte BE | 7000 |
 | Cluster mesh | bincode | 4-byte LE | 7001 |
+| DPDK peer I/O | bincode + UDP | DpdkPeerHeader (16B) | 7100 |
 | HTTP/S3 | HTTP/1.1 + JSON | — | 8000 |
 | NFS v3 | XDR / ONC RPC | RPC record mark | 2049 |
 | NBD | Big-endian binary | Fixed headers | 10809 |
@@ -538,14 +616,18 @@ cargo build -p sheep --no-default-features
 # With NFS
 cargo build -p sheep --features nfs
 
+# With DPDK data plane (requires system DPDK)
+cargo build -p sheep --features dpdk
+
 # sheepfs (requires system libfuse)
 cargo build -p sheepfs
 ```
 
-| Feature | Default | Crate |
-|---------|:-------:|-------|
-| `http` | yes | sheep |
-| `nfs` | no | sheep |
+| Feature | Default | Crate | Requires |
+|---------|:-------:|-------|----------|
+| `http` | yes | sheep | — |
+| `nfs` | no | sheep | — |
+| `dpdk` | no | sheep | libdpdk (system) |
 
 ---
 
@@ -561,6 +643,7 @@ cargo build -p sheepfs
 | Serialization | Hand-packed structs | bincode + serde |
 | HTTP server | Custom parser | axum |
 | Erasure coding | C library (jerasure) | reed-solomon-erasure (pure Rust) |
+| Data plane | Kernel TCP only | Pluggable: TCP (default) or DPDK |
 | QEMU attach | Native block driver | NBD export server |
 
 ---
@@ -603,6 +686,8 @@ cargo build -p sheepfs
 | Swift API | Done |
 | NFS v3 server | Done |
 | NBD export server | Done |
+| DPDK data plane (optional) | Done |
+| Pluggable transport (TCP/DPDK) | Done |
 | CLI tool (dog) | Done |
 | FUSE filesystem (sheepfs) | Done |
 | Cluster monitor (shepherd) | Done |

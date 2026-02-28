@@ -350,14 +350,10 @@ impl RecoveryWorker {
         Ok(())
     }
 
-    /// Fetch a single object from a peer node.
-    ///
-    /// Connects to the peer, sends a ReadPeer request, receives the object
-    /// data, and writes it to the local store.
+    /// Fetch a single object from a peer node via the peer transport.
     async fn fetch_object(&self, item: &RecoveryItem) -> SdResult<()> {
-        use sheepdog_proto::request::{RequestHeader, SdRequest, SdResponse, ResponseResult};
+        use sheepdog_proto::request::{RequestHeader, SdRequest, ResponseResult};
         use sheepdog_proto::constants::SD_SHEEP_PROTO_VER;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let addr = item.source.nid.socket_addr();
         debug!(
@@ -365,11 +361,11 @@ impl RecoveryWorker {
             item.oid, item.ec_index, addr
         );
 
-        // Connect to peer
-        let mut stream = sheepdog_core::net::connect_to_addr(addr).await?;
+        let (epoch, transport) = {
+            let s = self.sys.read().await;
+            (s.epoch(), s.peer_transport.clone())
+        };
 
-        // Build ReadPeer request
-        let epoch = self.sys.read().await.epoch();
         let header = RequestHeader {
             proto_ver: SD_SHEEP_PROTO_VER,
             epoch,
@@ -382,31 +378,7 @@ impl RecoveryWorker {
             length: 0, // 0 means read entire object
         };
 
-        // Send request (length-prefixed bincode)
-        let req_data = bincode::serialize(&(header, req))
-            .map_err(|_| SdError::SystemError)?;
-        stream
-            .write_u32(req_data.len() as u32)
-            .await
-            .map_err(|_| SdError::NetworkError)?;
-        stream
-            .write_all(&req_data)
-            .await
-            .map_err(|_| SdError::NetworkError)?;
-
-        // Read response
-        let resp_len = stream
-            .read_u32()
-            .await
-            .map_err(|_| SdError::NetworkError)? as usize;
-        let mut resp_buf = vec![0u8; resp_len];
-        stream
-            .read_exact(&mut resp_buf)
-            .await
-            .map_err(|_| SdError::NetworkError)?;
-
-        let response: SdResponse =
-            bincode::deserialize(&resp_buf).map_err(|_| SdError::SystemError)?;
+        let response = transport.send_request(addr, header, req).await?;
 
         // Extract data from response
         let data = match response.result {
@@ -433,22 +405,23 @@ impl RecoveryWorker {
         Ok(())
     }
 
-    /// Query a peer node for its list of stored object IDs.
+    /// Query a peer node for its list of stored object IDs via the peer transport.
     async fn query_peer_obj_list(
         &self,
         node: &SdNode,
         tgt_epoch: u32,
     ) -> SdResult<Vec<ObjectId>> {
         use sheepdog_proto::constants::SD_SHEEP_PROTO_VER;
-        use sheepdog_proto::request::{RequestHeader, SdRequest, SdResponse, ResponseResult};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use sheepdog_proto::request::{RequestHeader, SdRequest, ResponseResult};
 
         let addr = node.nid.socket_addr();
         debug!("recovery: querying obj list from {}", addr);
 
-        let mut stream = sheepdog_core::net::connect_to_addr(addr).await?;
+        let (epoch, transport) = {
+            let s = self.sys.read().await;
+            (s.epoch(), s.peer_transport.clone())
+        };
 
-        let epoch = self.sys.read().await.epoch();
         let header = RequestHeader {
             proto_ver: SD_SHEEP_PROTO_VER,
             epoch,
@@ -456,29 +429,7 @@ impl RecoveryWorker {
         };
         let req = SdRequest::GetObjList { tgt_epoch };
 
-        let req_data = bincode::serialize(&(header, req))
-            .map_err(|_| SdError::SystemError)?;
-        stream
-            .write_u32(req_data.len() as u32)
-            .await
-            .map_err(|_| SdError::NetworkError)?;
-        stream
-            .write_all(&req_data)
-            .await
-            .map_err(|_| SdError::NetworkError)?;
-
-        let resp_len = stream
-            .read_u32()
-            .await
-            .map_err(|_| SdError::NetworkError)? as usize;
-        let mut resp_buf = vec![0u8; resp_len];
-        stream
-            .read_exact(&mut resp_buf)
-            .await
-            .map_err(|_| SdError::NetworkError)?;
-
-        let response: SdResponse =
-            bincode::deserialize(&resp_buf).map_err(|_| SdError::SystemError)?;
+        let response = transport.send_request(addr, header, req).await?;
 
         match response.result {
             ResponseResult::Data(data) => {

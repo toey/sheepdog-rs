@@ -33,6 +33,7 @@ rand = "0.8"
 default = ["http"]
 http = ["dep:axum", "dep:hyper"]
 nfs = []
+dpdk = ["dep:sheepdog-dpdk"]
 
 [dependencies.axum]
 version = "0.7"
@@ -41,4 +42,8 @@ optional = true
 [dependencies.hyper]
 version = "1"
 features = ["http1", "server"]
+optional = true
+
+[dependencies.sheepdog-dpdk]
+path = "../sheepdog-dpdk"
 optional = true

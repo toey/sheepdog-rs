@@ -13,10 +13,10 @@ use std::sync::Arc;
 use sheepdog_proto::constants::SD_SHEEP_PROTO_VER;
 use sheepdog_proto::error::{SdError, SdResult};
 use sheepdog_proto::oid::ObjectId;
-use sheepdog_proto::request::{RequestHeader, ResponseResult, SdRequest, SdResponse};
+use sheepdog_proto::request::{RequestHeader, ResponseResult, SdRequest};
 use sheepdog_core::consistent_hash::VNodeInfo;
 use sheepdog_core::fec::{self, ErasureCoder};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use sheepdog_core::transport::PeerTransport;
 use tracing::{debug, info, warn};
 
 use crate::daemon::SharedSys;
@@ -84,49 +84,23 @@ async fn get_vdi_copies(sys: &SharedSys, oid: ObjectId) -> SdResult<(u8, u8)> {
     }
 }
 
-/// Send a peer request to a remote sheep node and return the result.
+/// Send a peer request to a remote sheep node via the peer transport.
+///
+/// Uses the pluggable `PeerTransport` (TCP or DPDK) to send the request
+/// and await the response. The transport handles connection management.
 async fn send_peer_request(
+    transport: &dyn PeerTransport,
     addr: SocketAddr,
     req: SdRequest,
     epoch: u32,
 ) -> SdResult<ResponseResult> {
-    let mut stream = sheepdog_core::net::connect_to_addr(addr).await?;
-
     let header = RequestHeader {
         proto_ver: SD_SHEEP_PROTO_VER,
         epoch,
         id: 0,
     };
 
-    let req_data =
-        bincode::serialize(&(header, req)).map_err(|_| SdError::SystemError)?;
-
-    stream
-        .write_u32(req_data.len() as u32)
-        .await
-        .map_err(|_| SdError::NetworkError)?;
-    stream
-        .write_all(&req_data)
-        .await
-        .map_err(|_| SdError::NetworkError)?;
-
-    let resp_len = stream
-        .read_u32()
-        .await
-        .map_err(|_| SdError::NetworkError)? as usize;
-
-    if resp_len > 64 * 1024 * 1024 {
-        return Err(SdError::InvalidParms);
-    }
-
-    let mut resp_buf = vec![0u8; resp_len];
-    stream
-        .read_exact(&mut resp_buf)
-        .await
-        .map_err(|_| SdError::NetworkError)?;
-
-    let response: SdResponse =
-        bincode::deserialize(&resp_buf).map_err(|_| SdError::SystemError)?;
+    let response = transport.send_request(addr, header, req).await?;
 
     match response.result {
         ResponseResult::Error(e) => Err(e),
@@ -235,7 +209,7 @@ async fn gateway_write_ec(
     );
 
     // Get target nodes — need `total` (d+p) nodes
-    let (nodes, this_node_nid, epoch) = {
+    let (nodes, this_node_nid, epoch, transport) = {
         let s = sys.read().await;
         debug!(
             "EC write: cinfo has {} nodes, requesting {} targets",
@@ -244,7 +218,7 @@ async fn gateway_write_ec(
         );
         let vnode_info = VNodeInfo::new(&s.cinfo.nodes);
         let target_nodes = vnode_info.oid_to_nodes(oid, total);
-        (target_nodes, s.this_node.nid.to_string(), s.epoch())
+        (target_nodes, s.this_node.nid.to_string(), s.epoch(), s.peer_transport.clone())
     };
 
     if nodes.len() < total {
@@ -281,7 +255,7 @@ async fn gateway_write_ec(
         let result = if is_local {
             crate::request::exec_local_request(sys.clone(), req).await
         } else {
-            send_peer_request(node.nid.socket_addr(), req, epoch).await
+            send_peer_request(transport.as_ref(), node.nid.socket_addr(), req, epoch).await
         };
 
         match result {
@@ -364,11 +338,11 @@ async fn gateway_write_replicate(
     data: Vec<u8>,
     create: bool,
 ) -> SdResult<ResponseResult> {
-    let (nodes, this_node_nid, epoch) = {
+    let (nodes, this_node_nid, epoch, transport) = {
         let s = sys.read().await;
         let vnode_info = VNodeInfo::new(&s.cinfo.nodes);
         let target_nodes = vnode_info.oid_to_nodes(oid, copies as usize);
-        (target_nodes, s.this_node.nid.to_string(), s.epoch())
+        (target_nodes, s.this_node.nid.to_string(), s.epoch(), s.peer_transport.clone())
     };
 
     if nodes.is_empty() {
@@ -381,42 +355,26 @@ async fn gateway_write_replicate(
 
     for (idx, node) in nodes.iter().enumerate() {
         let is_local = node.nid.to_string() == this_node_nid;
+        let peer_req = if create {
+            SdRequest::CreateAndWritePeer {
+                oid,
+                ec_index: idx as u8,
+                copies,
+                copy_policy,
+                data: data.as_ref().clone(),
+            }
+        } else {
+            SdRequest::WritePeer {
+                oid,
+                ec_index: idx as u8,
+                offset,
+                data: data.as_ref().clone(),
+            }
+        };
         let result = if is_local {
-            let peer_req = if create {
-                SdRequest::CreateAndWritePeer {
-                    oid,
-                    ec_index: idx as u8,
-                    copies,
-                    copy_policy,
-                    data: data.as_ref().clone(),
-                }
-            } else {
-                SdRequest::WritePeer {
-                    oid,
-                    ec_index: idx as u8,
-                    offset,
-                    data: data.as_ref().clone(),
-                }
-            };
             crate::request::exec_local_request(sys.clone(), peer_req).await
         } else {
-            let peer_req = if create {
-                SdRequest::CreateAndWritePeer {
-                    oid,
-                    ec_index: idx as u8,
-                    copies,
-                    copy_policy,
-                    data: data.as_ref().clone(),
-                }
-            } else {
-                SdRequest::WritePeer {
-                    oid,
-                    ec_index: idx as u8,
-                    offset,
-                    data: data.as_ref().clone(),
-                }
-            };
-            send_peer_request(node.nid.socket_addr(), peer_req, epoch).await
+            send_peer_request(transport.as_ref(), node.nid.socket_addr(), peer_req, epoch).await
         };
 
         match result {
@@ -472,11 +430,11 @@ async fn gateway_read_ec(
     let (d, p) = fec::ec_policy_to_dp(copy_policy);
     let total = d + p;
 
-    let (nodes, this_node_nid, epoch) = {
+    let (nodes, this_node_nid, epoch, transport) = {
         let s = sys.read().await;
         let vnode_info = VNodeInfo::new(&s.cinfo.nodes);
         let target_nodes = vnode_info.oid_to_nodes(oid, total);
-        (target_nodes, s.this_node.nid.to_string(), s.epoch())
+        (target_nodes, s.this_node.nid.to_string(), s.epoch(), s.peer_transport.clone())
     };
 
     // Read all strips (None = couldn't read from that node)
@@ -501,7 +459,7 @@ async fn gateway_read_ec(
         let result = if is_local {
             crate::request::exec_local_request(sys.clone(), req).await
         } else {
-            send_peer_request(node.nid.socket_addr(), req, epoch).await
+            send_peer_request(transport.as_ref(), node.nid.socket_addr(), req, epoch).await
         };
 
         match result {
@@ -579,7 +537,7 @@ async fn gateway_read_replicate(
     offset: u32,
     length: u32,
 ) -> SdResult<ResponseResult> {
-    let (nodes, this_node_nid, epoch) = {
+    let (nodes, this_node_nid, epoch, transport) = {
         let s = sys.read().await;
         let nr_copies = if let Some(state) = s.vdi_state.get(&oid.to_vid()) {
             state.nr_copies
@@ -588,7 +546,7 @@ async fn gateway_read_replicate(
         };
         let vnode_info = VNodeInfo::new(&s.cinfo.nodes);
         let target_nodes = vnode_info.oid_to_nodes(oid, nr_copies as usize);
-        (target_nodes, s.this_node.nid.to_string(), s.epoch())
+        (target_nodes, s.this_node.nid.to_string(), s.epoch(), s.peer_transport.clone())
     };
 
     if nodes.is_empty() {
@@ -624,7 +582,7 @@ async fn gateway_read_replicate(
                 offset,
                 length,
             };
-            match send_peer_request(node.nid.socket_addr(), req, epoch).await {
+            match send_peer_request(transport.as_ref(), node.nid.socket_addr(), req, epoch).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     warn!("remote read from {} failed: {}", node.nid, e);
@@ -643,11 +601,11 @@ async fn gateway_remove(
     oid: ObjectId,
     copies: u8,
 ) -> SdResult<ResponseResult> {
-    let (nodes, this_node_nid, epoch) = {
+    let (nodes, this_node_nid, epoch, transport) = {
         let s = sys.read().await;
         let vnode_info = VNodeInfo::new(&s.cinfo.nodes);
         let target_nodes = vnode_info.oid_to_nodes(oid, copies as usize);
-        (target_nodes, s.this_node.nid.to_string(), s.epoch())
+        (target_nodes, s.this_node.nid.to_string(), s.epoch(), s.peer_transport.clone())
     };
 
     for (idx, node) in nodes.iter().enumerate() {
@@ -659,7 +617,7 @@ async fn gateway_remove(
         if is_local {
             let _ = crate::request::exec_local_request(sys.clone(), req).await;
         } else {
-            let _ = send_peer_request(node.nid.socket_addr(), req, epoch).await;
+            let _ = send_peer_request(transport.as_ref(), node.nid.socket_addr(), req, epoch).await;
         }
     }
 

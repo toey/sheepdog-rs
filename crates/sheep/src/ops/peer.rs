@@ -338,16 +338,15 @@ async fn get_hash(sys: SharedSys, oid: ObjectId, _tgt_epoch: u32) -> SdResult<Re
 }
 
 /// Repair a replica by fetching the object from another node that has it
-/// and rewriting it locally.
+/// and rewriting it locally. Uses the peer transport for network I/O.
 async fn repair_replica(sys: SharedSys, oid: ObjectId) -> SdResult<ResponseResult> {
     use sheepdog_proto::constants::SD_SHEEP_PROTO_VER;
-    use sheepdog_proto::request::{RequestHeader, SdResponse};
+    use sheepdog_proto::request::RequestHeader;
     use sheepdog_core::consistent_hash::VNodeInfo;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     debug!("repair_replica: {:?}", oid);
 
-    let (nodes, this_nid, epoch, nr_copies) = {
+    let (nodes, this_nid, epoch, transport) = {
         let s = sys.read().await;
         let nr_copies = if let Some(state) = s.vdi_state.get(&oid.to_vid()) {
             state.nr_copies
@@ -356,7 +355,7 @@ async fn repair_replica(sys: SharedSys, oid: ObjectId) -> SdResult<ResponseResul
         };
         let vnode_info = VNodeInfo::new(&s.cinfo.nodes);
         let target_nodes = vnode_info.oid_to_nodes(oid, nr_copies as usize);
-        (target_nodes, s.this_node.nid.to_string(), s.epoch(), nr_copies)
+        (target_nodes, s.this_node.nid.to_string(), s.epoch(), s.peer_transport.clone())
     };
 
     // Try to read the object from each peer (skip self)
@@ -366,37 +365,26 @@ async fn repair_replica(sys: SharedSys, oid: ObjectId) -> SdResult<ResponseResul
         }
 
         let addr = node.nid.socket_addr();
-        let result: Result<Vec<u8>, SdError> = async {
-            let mut stream = sheepdog_core::net::connect_to_addr(addr).await?;
-            let header = RequestHeader {
-                proto_ver: SD_SHEEP_PROTO_VER,
-                epoch,
-                id: 0,
-            };
-            let req = SdRequest::ReadPeer {
-                oid,
-                ec_index: idx as u8,
-                offset: 0,
-                length: 0, // 0 = read entire object
-            };
-            let req_data = bincode::serialize(&(header, req))
-                .map_err(|_| SdError::SystemError)?;
-            stream.write_u32(req_data.len() as u32).await.map_err(|_| SdError::NetworkError)?;
-            stream.write_all(&req_data).await.map_err(|_| SdError::NetworkError)?;
+        let header = RequestHeader {
+            proto_ver: SD_SHEEP_PROTO_VER,
+            epoch,
+            id: 0,
+        };
+        let req = SdRequest::ReadPeer {
+            oid,
+            ec_index: idx as u8,
+            offset: 0,
+            length: 0, // 0 = read entire object
+        };
 
-            let resp_len = stream.read_u32().await.map_err(|_| SdError::NetworkError)? as usize;
-            let mut resp_buf = vec![0u8; resp_len];
-            stream.read_exact(&mut resp_buf).await.map_err(|_| SdError::NetworkError)?;
-
-            let response: SdResponse = bincode::deserialize(&resp_buf)
-                .map_err(|_| SdError::SystemError)?;
-            match response.result {
+        let result = match transport.send_request(addr, header, req).await {
+            Ok(resp) => match resp.result {
                 ResponseResult::Data(d) => Ok(d),
                 ResponseResult::Error(e) => Err(e),
                 _ => Err(SdError::InvalidParms),
-            }
-        }
-        .await;
+            },
+            Err(e) => Err(e),
+        };
 
         match result {
             Ok(data) if !data.is_empty() => {

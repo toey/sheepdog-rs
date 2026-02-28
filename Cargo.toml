@@ -7,8 +7,9 @@ members = [
     "crates/dog",
     "crates/sheepfs",
     "crates/shepherd",
+    "crates/sheepdog-dpdk",
 ]
-# Exclude sheepfs from default build (requires system libfuse)
+# Exclude sheepfs (requires libfuse) and sheepdog-dpdk (requires system DPDK)
 default-members = [
     "crates/sheepdog-proto",
     "crates/sheepdog-core",
@@ -37,3 +38,4 @@ clap = { version = "4", features = ["derive"] }
 bytes = "1"
 dashmap = "6"
 sha1 = "0.10"
+crossbeam-channel = "0.5"

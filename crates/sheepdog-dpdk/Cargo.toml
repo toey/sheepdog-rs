@@ -1,0 +1,21 @@
+[package]
+name = "sheepdog-dpdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DPDK user-space data plane transport for sheepdog distributed storage"
+
+[dependencies]
+sheepdog-proto = { workspace = true }
+sheepdog-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+[build-dependencies]
+bindgen = "0.70"
+pkg-config = "0.3"

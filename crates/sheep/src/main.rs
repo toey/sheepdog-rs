@@ -42,6 +42,7 @@ use tracing::{error, info, warn};
 
 use sheepdog_proto::constants::SD_LISTEN_PORT;
 use sheepdog_proto::node::{NodeId, SdNode};
+use sheepdog_core::transport::PeerTransport;
 
 use crate::cluster::{ClusterDriver, ClusterEvent};
 use crate::daemon::SystemInfo;
@@ -138,6 +139,30 @@ struct Args {
     /// Cluster communication port offset from listen port (sdcluster driver only)
     #[arg(long, default_value_t = 1)]
     cluster_port_offset: u16,
+
+    /// Enable DPDK data plane acceleration for peer I/O
+    #[arg(long)]
+    dpdk: bool,
+
+    /// DPDK EAL arguments (e.g. "-l 0-3 -n 4 --file-prefix sheep")
+    #[arg(long, default_value = "")]
+    dpdk_eal_args: String,
+
+    /// DPDK port IDs to use (comma-separated, e.g. "0" or "0,1")
+    #[arg(long, default_value = "0")]
+    dpdk_ports: String,
+
+    /// DPDK data plane UDP port
+    #[arg(long, default_value_t = 7100)]
+    dpdk_port: u16,
+
+    /// DPDK IP address for data plane NIC
+    #[arg(long)]
+    dpdk_addr: Option<String>,
+
+    /// Number of DPDK RX/TX queues per port
+    #[arg(long, default_value_t = 1)]
+    dpdk_queues: u16,
 }
 
 #[tokio::main]
@@ -184,8 +209,60 @@ async fn main() {
         }
     }
 
+    // Build peer transport
+    let peer_transport: Arc<dyn PeerTransport> = if args.dpdk {
+        #[cfg(feature = "dpdk")]
+        {
+            let dpdk_addr: std::net::IpAddr = args
+                .dpdk_addr
+                .as_ref()
+                .expect("--dpdk-addr is required when --dpdk is used")
+                .parse()
+                .expect("invalid --dpdk-addr IP address");
+
+            // Set io_addr/io_port on this node so peers know to use DPDK
+            this_node.nid.io_addr = Some(dpdk_addr);
+            this_node.nid.io_port = args.dpdk_port;
+
+            let config = sheepdog_dpdk::DpdkConfig {
+                eal_args: shell_words_split(&args.dpdk_eal_args),
+                nr_queues: args.dpdk_queues,
+                nr_mbufs: 8191,
+                mbuf_cache_size: 250,
+                port_ids: args
+                    .dpdk_ports
+                    .split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect(),
+                data_port: args.dpdk_port,
+                local_ip: dpdk_addr,
+            };
+
+            info!(
+                "DPDK data plane enabled: addr={}, port={}, eal_args='{}'",
+                dpdk_addr, args.dpdk_port, args.dpdk_eal_args
+            );
+
+            match sheepdog_dpdk::DpdkTransport::new(config) {
+                Ok(t) => Arc::new(t),
+                Err(e) => {
+                    error!("failed to initialize DPDK: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        #[cfg(not(feature = "dpdk"))]
+        {
+            error!("sheep was compiled without DPDK support. Rebuild with: cargo build -p sheep --features dpdk");
+            std::process::exit(1);
+        }
+    } else {
+        info!("using TCP peer transport (default)");
+        Arc::new(sheepdog_core::tcp_transport::TcpTransport::new(8))
+    };
+
     // Build system info
-    let mut sys_info = SystemInfo::new(listen_addr, args.dir.clone(), this_node);
+    let mut sys_info = SystemInfo::new(listen_addr, args.dir.clone(), this_node, peer_transport);
     sys_info.gateway_mode = args.gateway;
     sys_info.use_directio = args.directio;
     sys_info.journal_dir = args.journal;
@@ -365,6 +442,14 @@ async fn main() {
         s.shutdown_notify.notify_waiters();
     }
 
+    // Shutdown peer transport
+    {
+        let s = sys.read().await;
+        if let Err(e) = s.peer_transport.shutdown().await {
+            warn!("peer transport shutdown error: {}", e);
+        }
+    }
+
     // Save config before exit
     {
         let s = sys.read().await;
@@ -516,4 +601,14 @@ async fn handle_cluster_notify(sys: Arc<RwLock<SystemInfo>>, data: &[u8]) {
             info!("cluster recovery enabled");
         }
     }
+}
+
+/// Simple shell-like word splitting for DPDK EAL arguments.
+#[cfg(feature = "dpdk")]
+fn shell_words_split(s: &str) -> Vec<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Vec::new();
+    }
+    s.split_whitespace().map(|w| w.to_string()).collect()
 }

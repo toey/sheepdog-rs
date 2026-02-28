@@ -13,6 +13,7 @@ use tokio::sync::{Notify, RwLock};
 
 use sheepdog_proto::node::{ClusterInfo, ClusterStatus, NodeStatus, SdNode};
 use sheepdog_proto::vdi::VdiState;
+use sheepdog_core::transport::PeerTransport;
 
 /// Shared daemon state, replaces the C global `sys`.
 pub type SharedSys = Arc<RwLock<SystemInfo>>;
@@ -76,6 +77,9 @@ pub struct SystemInfo {
     /// Object cache instance (None if caching disabled).
     pub object_cache: Option<Arc<crate::object_cache::ObjectCache>>,
 
+    /// Peer transport (TCP or DPDK) for data-plane I/O.
+    pub peer_transport: Arc<dyn PeerTransport>,
+
     /// Multi-disk paths.
     pub md_disks: Vec<PathBuf>,
 
@@ -96,7 +100,12 @@ pub struct SystemInfo {
 }
 
 impl SystemInfo {
-    pub fn new(listen_addr: SocketAddr, dir: PathBuf, this_node: SdNode) -> Self {
+    pub fn new(
+        listen_addr: SocketAddr,
+        dir: PathBuf,
+        this_node: SdNode,
+        peer_transport: Arc<dyn PeerTransport>,
+    ) -> Self {
         Self {
             cinfo: ClusterInfo::default(),
             this_node,
@@ -117,6 +126,7 @@ impl SystemInfo {
             epoch_notify: Arc::new(Notify::new()),
             shutdown_notify: Arc::new(Notify::new()),
             object_cache: None,
+            peer_transport,
             md_disks: Vec::new(),
             vdi_deleted: bitvec![u8, Msb0; 0; sheepdog_proto::constants::SD_NR_VDIS as usize],
             tracing_enabled: false,
