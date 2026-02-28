@@ -1,592 +1,541 @@
 # sheepdog-rs
 
-Rust implementation of [Sheepdog](https://sheepdog.github.io/sheepdog/) — a distributed block storage system for QEMU/KVM.
+A **Rust** rewrite of [Sheepdog](https://sheepdog.github.io/sheepdog/) — distributed block storage for QEMU/KVM virtual machines.
 
-Sheepdog provides highly available block-level storage volumes that can be attached to QEMU/KVM virtual machines. It uses consistent hashing to distribute data across cluster nodes without any centralized metadata server.
-
-> **15,500+ lines of Rust** across 6 crates — fully async (tokio), memory-safe, zero external cluster dependencies.
-
-## Architecture
+> 16,000+ lines of async Rust across 6 crates. No external cluster dependencies.
+> Connects to QEMU via NBD — works with QEMU 6.0+ (which removed native sheepdog support).
 
 ```
-                       +-----------+
-                       |  QEMU/KVM |
-                       +-----+-----+
-                             |  nbd://host:10809/vdi-name
-              +--------------+--------------+
-              |              |              |
-         +----+----+   +----+----+   +-----+----+
-         |  sheep  |   |  sheep  |   |  sheep   |
-         | node 0  |   | node 1  |   | node 2   |
-         +----+----+   +----+----+   +-----+----+
-              |              |              |
-              +--------------+--------------+
-              P2P TCP Mesh + Consistent Hash Ring
+               QEMU / qemu-img                    dog CLI
+                     |                               |
+              nbd://host:10809/vdi              tcp://host:7000
+                     |                               |
+   +-----------+-----+-----+-----------+             |
+   |           |           |           |             |
++--+---+   +--+---+   +---+--+   +----+-+     +-----+-----+
+| sheep |===| sheep |===| sheep |===| sheep |     | shepherd  |
+| :7000 |   | :7002 |   | :7004 |   | :7006 |     | (monitor) |
++--+---+   +--+---+   +---+--+   +----+-+     +-----------+
+   |           |           |           |
+   +-----+-----+-----+-----+-----+----+
+         |                 |
+    Consistent Hash    4 MB Objects
+      (vnodes)         (replicated)
 ```
 
-**Sheepdog** distributes virtual disk images (VDIs) as 4 MB data objects across a cluster of **sheep** daemons. Objects are replicated (or erasure-coded) to multiple nodes for fault tolerance. There is no single point of failure — every sheep node can serve any client request by forwarding it to the correct peer through the hash ring.
+Virtual disk images (VDIs) are split into **4 MB objects** and distributed across **sheep** daemons using consistent hashing. Each object is replicated to N nodes (configurable). No single point of failure — any sheep can serve any request by forwarding to the responsible peer.
+
+---
+
+## Quick Start
+
+### 1. Build
+
+```bash
+cargo build --release
+```
+
+Produces three binaries in `target/release/`:
+
+| Binary | Size | Description |
+|--------|------|-------------|
+| `sheep` | 4.5 MB | Storage daemon |
+| `dog` | 3.0 MB | CLI admin tool |
+| `shepherd` | 2.4 MB | Cluster monitor |
+
+Requirements: **Rust 1.70+**, Linux/macOS/FreeBSD.
+
+### 2. Single node
+
+```bash
+# Start daemon
+sheep /tmp/sheepdata
+
+# Format cluster (1 replica for single-node)
+dog cluster format --copies 1
+
+# Create a 20 GB virtual disk
+dog vdi create mydisk 20G
+
+# Verify
+dog vdi list
+```
+
+### 3. Connect QEMU via NBD
+
+```bash
+# Start daemon with NBD enabled
+sheep --nbd /tmp/sheepdata
+dog cluster format --copies 1
+dog vdi create mydisk 20G
+
+# Launch VM
+qemu-system-x86_64 \
+  -drive file=nbd://127.0.0.1:10809/mydisk,format=raw,if=virtio \
+  -m 2048 -enable-kvm ...
+
+# Or use qemu-img / qemu-io directly
+qemu-img info    nbd://127.0.0.1:10809/mydisk
+qemu-img create -f raw nbd://127.0.0.1:10809/mydisk 20G
+qemu-io  -f raw -c "write -P 0xAB 0 4096" nbd://127.0.0.1:10809/mydisk
+qemu-io  -f raw -c "read  -P 0xAB 0 4096" nbd://127.0.0.1:10809/mydisk
+```
+
+### 4. Multi-node cluster
+
+```bash
+# Node 0 (first node)
+sheep --cluster-driver sdcluster -b 10.0.0.1 -p 7000 /data/sheep
+
+# Node 1 (joins via seed)
+sheep --cluster-driver sdcluster -b 10.0.0.2 -p 7000 \
+      --seed 10.0.0.1:7000 /data/sheep
+
+# Node 2 (multiple seeds for redundancy)
+sheep --cluster-driver sdcluster -b 10.0.0.3 -p 7000 \
+      --seed 10.0.0.1:7000 --seed 10.0.0.2:7000 /data/sheep
+
+# Format with 3-way replication
+dog -a 10.0.0.1 cluster format --copies 3
+dog -a 10.0.0.1 node list
+```
+
+### 5. Localhost test cluster
+
+```bash
+# 3 nodes on different ports
+sheep --cluster-driver sdcluster -b 127.0.0.1 -p 7000 \
+      --nbd --http-port 8000 /tmp/sheep/n0
+
+sheep --cluster-driver sdcluster -b 127.0.0.1 -p 7002 \
+      --seed 127.0.0.1:7000 --http-port 8002 /tmp/sheep/n1
+
+sheep --cluster-driver sdcluster -b 127.0.0.1 -p 7004 \
+      --seed 127.0.0.1:7000 --http-port 8004 /tmp/sheep/n2
+
+dog node list
+# Id | Host      | Port | VNodes | Zone | Status
+#  0 | 127.0.0.1 | 7000 |  128   |  0   | alive
+#  1 | 127.0.0.1 | 7002 |  128   |  0   | alive
+#  2 | 127.0.0.1 | 7004 |  128   |  0   | alive
+```
+
+---
 
 ## Workspace
 
 ```
 sheepdog-rs/
-├── Cargo.toml                      # workspace root (v0.10.0, edition 2021)
 ├── crates/
-│   ├── sheepdog-proto/  (1,451 LOC)  # wire protocol, types, constants
-│   ├── sheepdog-core/   (  414 LOC)  # consistent hash, erasure coding, networking
-│   ├── sheep/           (10,067 LOC) # storage daemon
-│   ├── dog/             (2,679 LOC)  # CLI admin tool
-│   ├── shepherd/        (  344 LOC)  # cluster coordinator
-│   └── sheepfs/         (  554 LOC)  # FUSE filesystem
+│   ├── sheepdog-proto/   1,457 LOC   Wire protocol, types, constants
+│   ├── sheepdog-core/      414 LOC   Consistent hashing, erasure coding
+│   ├── sheep/           10,945 LOC   Storage daemon
+│   ├── dog/              2,679 LOC   CLI admin tool
+│   ├── shepherd/           344 LOC   Cluster monitor
+│   └── sheepfs/            554 LOC   FUSE filesystem (optional)
+└── Cargo.toml                        Workspace root (v0.10.0)
 ```
 
-| Crate | Binary | Description | LOC |
-|-------|--------|-------------|----:|
-| `sheepdog-proto` | *(library)* | Wire protocol, object IDs, error types, constants | 1,451 |
-| `sheepdog-core` | *(library)* | Consistent hashing, erasure coding, networking | 414 |
-| `sheep` | `sheep` | Storage daemon — object I/O, replication, recovery, HTTP/S3, NFS | 10,067 |
-| `dog` | `dog` | CLI admin tool — VDI / node / cluster management | 2,679 |
-| `shepherd` | `shepherd` | Cluster coordinator — heartbeat monitoring | 344 |
-| `sheepfs` | `sheepfs` | FUSE filesystem — mount VDIs as local files | 554 |
+### sheepdog-proto — Protocol Library
 
-## Building
+Wire types shared by all components:
 
-```bash
-# Build all default crates (excludes sheepfs which needs libfuse)
-cargo build --release
+- `SdRequest` / `ResponseResult` — 30+ request variants (read, write, VDI ops, cluster ops)
+- `ObjectId` — 64-bit OID encoding (8-bit flags + 24-bit VDI ID + 32-bit object index)
+- `SdNode` / `NodeId` — Node identity (IP + port + zone)
+- `ClusterInfo` / `ClusterStatus` — Cluster metadata and state machine
+- `SdError` — Typed error enum with 30+ variants
+- `SdInode` — On-disk inode structure (name, size, data map)
+- `VdiState` / `LockState` — Runtime VDI state and locking
 
-# Build with sheepfs (requires libfuse/macFUSE)
-cargo build --release -p sheepfs
-```
+### sheepdog-core — Core Library
 
-**Requirements**: Rust 1.70+ (edition 2021). Linux, macOS, or FreeBSD. libfuse / macFUSE only for `sheepfs`.
-
-**Binaries** are placed in `target/release/`:
-
-```
-sheep      ~4.7 MB   storage daemon
-dog        ~3.1 MB   CLI tool
-shepherd   ~2.4 MB   cluster coordinator
-```
-
-## Quick Start
-
-### Single-node (development)
-
-```bash
-# Start sheep with default local driver
-sheep /tmp/sheep/store
-
-# Format the cluster and create a VDI
-dog cluster format -c 1
-dog vdi create my-disk 10G
-dog vdi list
-dog node list
-```
-
-### Multi-node cluster (production)
-
-```bash
-# Node 0 — first node (no seeds needed)
-sheep --cluster-driver sdcluster -b 10.0.0.1 -p 7000 /data/sheep
-
-# Node 1 — joins via seed
-sheep --cluster-driver sdcluster -b 10.0.0.2 -p 7000 \
-      --seed 10.0.0.1:7000 /data/sheep
-
-# Node 2 — multiple seeds for redundancy
-sheep --cluster-driver sdcluster -b 10.0.0.3 -p 7000 \
-      --seed 10.0.0.1:7000 --seed 10.0.0.2:7000 /data/sheep
-
-# Format with 3-way replication
-dog -a 10.0.0.1 cluster format -c 3
-dog -a 10.0.0.1 node list
-```
-
-### Localhost multi-node (testing)
-
-```bash
-# 3 nodes on localhost with different ports
-sheep --cluster-driver sdcluster -b 127.0.0.1 -p 7000 \
-      --http-port 8000 /tmp/sheep/node0
-
-sheep --cluster-driver sdcluster -b 127.0.0.1 -p 7002 \
-      --seed 127.0.0.1:7000 --http-port 8002 /tmp/sheep/node1
-
-sheep --cluster-driver sdcluster -b 127.0.0.1 -p 7004 \
-      --seed 127.0.0.1:7000 --http-port 8004 /tmp/sheep/node2
-
-# Verify
-dog node list
-# +----+-----------+------+--------+------+-------+--------+
-# | Id | Host      | Port | VNodes | Zone | Space | Status |
-# +----+-----------+------+--------+------+-------+--------+
-# | 0  | 127.0.0.1 | 7000 | 128    | 0    | 0 B   | alive  |
-# | 1  | 127.0.0.1 | 7002 | 128    | 0    | 0 B   | alive  |
-# | 2  | 127.0.0.1 | 7004 | 128    | 0    | 0 B   | alive  |
-# +----+-----------+------+--------+------+-------+--------+
-```
-
-### Use with QEMU (via NBD)
-
-QEMU removed the native sheepdog block driver in v6.0+. Use the built-in **NBD export server** instead:
-
-```bash
-# Start sheep with NBD enabled
-sheep --nbd /data/sheep
-
-# Create a VDI
-dog cluster format --copies 1
-dog vdi create my-disk 20G
-
-# Use with QEMU via NBD
-qemu-system-x86_64 \
-  -drive file=nbd://127.0.0.1:10809/my-disk,format=raw,if=virtio \
-  -m 1024 ...
-
-# Or create/inspect with qemu-img
-qemu-img info nbd://127.0.0.1:10809/my-disk
-qemu-img create -f raw nbd://127.0.0.1:10809/my-disk 20G
-```
-
-## Components
+- **Consistent hashing** — Virtual node ring with zone-aware placement
+- **Erasure coding** — Reed-Solomon via `reed-solomon-erasure`
+- **Networking** — Async TCP helpers, socket FD caching
 
 ### sheep — Storage Daemon
 
-The main daemon that stores data objects and serves client requests.
-
-```
-sheep [OPTIONS] <DIR>
-
-Arguments:
-  <DIR>                          Data directory for object storage
-
-Options:
-  -b, --bind-addr <ADDR>         Listen address [default: 0.0.0.0]
-  -p, --port <PORT>              Listen port [default: 7000]
-  -g, --gateway                  Gateway mode (no local storage)
-  -c, --copies <N>               Number of replicas
-  -z, --zone <ID>                Fault zone ID [default: 0]
-  -v, --vnodes <N>               Virtual nodes per physical node [default: 128]
-  -j, --journal <DIR>            Journal directory
-  -w, --cache                    Enable object cache
-      --cache-size <MB>          Object cache size [default: 256]
-      --directio                 Enable direct I/O
-      --http-port <PORT>         HTTP/S3 API port [default: 8000]
-      --nfs                      Enable NFS server
-      --nfs-port <PORT>          NFS port [default: 2049]
-      --nbd                      Enable NBD export server
-      --nbd-port <PORT>          NBD port [default: 10809]
-  -l, --log-level <LEVEL>        Log level [default: info]
-      --cluster-driver <NAME>    Cluster driver: local or sdcluster [default: local]
-      --seed <HOST:PORT>         Seed node address (repeatable, sdcluster only)
-      --cluster-port-offset <N>  Cluster port = listen port + offset [default: 1]
-```
-
-#### Internal Architecture
+The main daemon. Handles object I/O, replication, recovery, and exposes multiple server interfaces.
 
 ```
 sheep startup
+  ├── ClusterDriver.init()    Listen on cluster port
+  ├── ClusterDriver.join()    Connect to seeds, exchange members
   │
-  ├── Create ClusterDriver (local or sdcluster)
-  ├── driver.init()       → listen on cluster port, start heartbeat/reaper
-  ├── driver.join()       → connect to seeds, exchange member list
+  ├── cluster_event_loop()    Join / Leave / Notify / Block / Unblock
+  ├── accept_loop()           Client TCP → dispatch to ops handler
+  ├── recovery_worker()       Background object migration
   │
-  ├── cluster_event_loop()
-  │     Join(node)        → group::handle_node_join()    → bump epoch
-  │     Leave(node)       → group::handle_node_leave()   → bump epoch
-  │     Notify(data)      → handle_cluster_notify()      → format/shutdown/alter-copy
-  │     Block             → pause for two-phase update
-  │     Unblock(data)     → resume + apply
-  │
-  ├── accept_loop()       → client request pipeline
-  │     read_request()    → dispatch to ops/{gateway,peer,cluster,local}
-  │
-  ├── http_server()       → S3/Swift API on :8000 (optional, axum)
-  ├── nfs_server()        → NFS v3 on :2049 (optional, ONC RPC)
-  ├── nbd_server()        → NBD export on :10809 (optional, for QEMU)
-  │
-  shutdown:
-    ├── driver.leave()    → announce departure to all peers
-    └── save_config()     → persist cluster state to disk
+  ├── http_server()           S3/Swift on :8000 (optional)
+  ├── nfs_server()            NFS v3 on :2049 (optional)
+  └── nbd_server()            NBD export on :10809 (optional)
 ```
 
-#### Request Pipeline
+**Request pipeline:**
 
 ```
-Client TCP → accept_loop() → handle_client()
-                                  │
-                           read_request() [u32 len + bincode]
-                                  │
-                           dispatch(SdRequest)
-                              ├── OpType::Gateway  → forward to correct node via hash ring
-                              ├── OpType::Peer     → local object I/O for peer requests
-                              ├── OpType::Cluster  → cluster-wide ops (format, VDI create)
-                              └── OpType::Local    → node-local queries (info, stat)
-                                  │
-                           send_response() [bincode]
+Client TCP → read_request() → dispatch(SdRequest)
+                                 ├── Gateway  → forward via hash ring
+                                 ├── Peer     → local object I/O
+                                 ├── Cluster  → VDI create/delete, format
+                                 └── Local    → node info, stat queries
 ```
 
-#### Storage Backends
+**Largest modules:**
 
-| Backend | Layout | Use case |
-|---------|--------|----------|
-| `plain` | `/obj/{oid_hex}` | Simple flat directory |
-| `tree` | `/obj/{vid_hex}/{oid_hex}` | Hierarchical, better for large VDI counts |
-| `md` | Multi-disk with balancing | Production with multiple drives |
-
-#### Feature Modules (sheep)
-
-| Module | LOC | Purpose |
-|--------|----:|---------|
+| Module | Lines | Purpose |
+|--------|------:|---------|
 | `cluster/sdcluster.rs` | 1,293 | P2P TCP mesh driver |
-| `recovery.rs` | 662 | Background object migration on topology change |
+| `nbd/mod.rs` | 844 | NBD export server |
+| `recovery.rs` | 662 | Background object migration |
 | `store/md.rs` | 568 | Multi-disk storage backend |
-| `object_cache.rs` | 542 | LRU object cache (dashmap) |
-| `ops/peer.rs` | 443 | Peer-to-peer I/O operations |
-| `journal.rs` | 440 | Write-ahead logging (memmap2) |
-| `ops/cluster.rs` | 427 | Cluster-wide operations (format, VDI create/delete) |
-| `nfs/mod.rs` + `handler.rs` | 748 | NFS v3 server (ONC RPC over TCP) |
-| `nbd/mod.rs` | 844 | NBD export server (for QEMU/qemu-img) |
-| `http/*.rs` | 691 | HTTP/S3/Swift API (axum) |
+| `object_cache.rs` | 542 | LRU object cache |
+| `ops/peer.rs` | 443 | Peer-to-peer I/O |
+| `ops/cluster.rs` | 440 | Cluster-wide operations |
+| `journal.rs` | 440 | Write-ahead journal |
+| `nfs/*.rs` | 1,139 | NFS v3 server (ONC RPC) |
+| `http/*.rs` | 691 | HTTP/S3/Swift API |
 
 ### dog — CLI Admin Tool
 
 ```
 dog [OPTIONS] <COMMAND>
 
-Commands:
-  vdi       VDI (Virtual Disk Image) management
-  node      Cluster node management
-  cluster   Cluster-wide operations
-  upgrade   Cluster upgrade utilities
-
 Options:
-  -a, --address <ADDR>     Sheep daemon address [default: 127.0.0.1]
-  -p, --port <PORT>        Sheep daemon port [default: 7000]
-  -v, --verbose            Verbose output
+  -a, --address <ADDR>    Sheep address [default: 127.0.0.1]
+  -p, --port <PORT>       Sheep port [default: 7000]
+
+Commands:
+  vdi       Virtual disk management
+  node      Node management
+  cluster   Cluster operations
+  upgrade   Upgrade utilities
 ```
 
 **VDI commands:**
 
-| Command | Description |
-|---------|-------------|
-| `dog vdi create <name> <size>` | Create a new VDI |
-| `dog vdi delete <name>` | Delete a VDI |
-| `dog vdi list` | List all VDIs |
-| `dog vdi snapshot <name> -s <tag>` | Create a snapshot |
-| `dog vdi clone <src> <dst>` | Clone a VDI or snapshot |
-| `dog vdi resize <name> <size>` | Resize a VDI |
-| `dog vdi object <name>` | Show object layout map |
-| `dog vdi tree` | Show snapshot/clone tree |
-| `dog vdi setattr <name> <key> <val>` | Set VDI attribute |
-| `dog vdi getattr <name> <key>` | Get VDI attribute |
-| `dog vdi lock list` | List VDI locks |
-| `dog vdi lock unlock <name>` | Force-unlock a VDI |
-
-**Node commands:**
-
-| Command | Description |
-|---------|-------------|
-| `dog node list` | List cluster nodes with status |
-| `dog node info` | Detailed node information |
-| `dog node recovery` | Show recovery progress |
-| `dog node md info` | Multi-disk layout |
-| `dog node md plug <path>` | Add a disk online |
-| `dog node md unplug <path>` | Remove a disk online |
+```bash
+dog vdi create <name> <size>        # Create VDI
+dog vdi delete <name>               # Delete VDI
+dog vdi list                        # List all VDIs
+dog vdi snapshot <name> -s <tag>    # Take snapshot
+dog vdi clone <src> <dst>           # Clone VDI
+dog vdi resize <name> <size>        # Resize VDI
+dog vdi object <name>               # Show object map
+dog vdi tree                        # Show snapshot/clone tree
+dog vdi lock list                   # Show locks
+dog vdi lock unlock <name>          # Force unlock
+```
 
 **Cluster commands:**
 
-| Command | Description |
-|---------|-------------|
-| `dog cluster info` | Cluster status and config |
-| `dog cluster format -c <N>` | Format with N replicas |
-| `dog cluster shutdown` | Graceful cluster-wide shutdown |
-| `dog cluster check` | Health and consistency check |
-| `dog cluster alter-copy -c <N>` | Change default replica count |
-| `dog cluster recover enable/disable` | Toggle auto-recovery |
-
-### sheepfs — FUSE Filesystem
-
-Mount sheepdog VDIs as local files:
-
 ```bash
-sheepfs /mnt/sheepdog -a 127.0.0.1 -p 7000
-ls /mnt/sheepdog/vdi/
-cat /mnt/sheepdog/vdi/my-disk > disk.img
+dog cluster info                    # Cluster status
+dog cluster format -c <N>           # Format with N replicas
+dog cluster shutdown                # Graceful shutdown
+dog cluster check                   # Health check
+dog cluster alter-copy -c <N>       # Change replica count
+dog cluster recover enable/disable  # Toggle recovery
 ```
 
-Options: `-f` foreground, `--cache-timeout <sec>`. Requires libfuse (Linux) or macFUSE (macOS).
+**Node commands:**
 
-### shepherd — Cluster Coordinator
+```bash
+dog node list                       # List nodes
+dog node info                       # Node details
+dog node recovery                   # Recovery progress
+dog node md info                    # Multi-disk layout
+dog node md plug <path>             # Add disk
+dog node md unplug <path>           # Remove disk
+```
 
-Optional heartbeat monitor for production:
+### shepherd — Cluster Monitor
+
+Heartbeat monitor for production clusters:
 
 ```bash
 shepherd -b 0.0.0.0 -p 7100 --heartbeat-interval 5 --failure-timeout 30
 ```
 
-## Cluster Membership
+### sheepfs — FUSE Filesystem
 
-### P2P TCP Mesh (`sdcluster` driver)
+Mount VDIs as local files (requires libfuse/macFUSE):
 
-Unlike the original C implementation which relied on external cluster engines (Corosync/ZooKeeper), the Rust port includes a **built-in P2P TCP mesh** with zero external dependencies.
+```bash
+cargo build --release -p sheepfs
+sheepfs /mnt/sheepdog -a 127.0.0.1 -p 7000
+ls /mnt/sheepdog/vdi/
+```
+
+---
+
+## sheep CLI Reference
 
 ```
-       sheep:7000 ◄────────────► sheep:7002
-       cluster:7001              cluster:7003
-           ▲ ╲                    ╱ ▲
-           │   ╲  Heartbeat     ╱   │
-           │    ╲  Join/Leave  ╱    │
-           │     ╲ Notify     ╱     │
-           │      ╲          ╱      │
-           ▼       ▼        ▼       ▼
+sheep [OPTIONS] <DIR>
+
+Arguments:
+  <DIR>                       Data directory
+
+Options:
+  -b, --bind-addr <ADDR>      Listen address [default: 0.0.0.0]
+  -p, --port <PORT>           Listen port [default: 7000]
+  -g, --gateway               Gateway mode (no local storage)
+  -c, --copies <N>            Replica count
+  -z, --zone <ID>             Fault zone [default: 0]
+  -v, --vnodes <N>            Virtual nodes [default: 128]
+  -j, --journal <DIR>         Journal directory
+  -w, --cache                 Enable object cache
+      --cache-size <MB>       Cache size [default: 256]
+      --directio              Direct I/O
+      --http-port <PORT>      HTTP/S3 port [default: 8000]
+      --nfs                   Enable NFS server
+      --nfs-port <PORT>       NFS port [default: 2049]
+      --nbd                   Enable NBD server
+      --nbd-port <PORT>       NBD port [default: 10809]
+  -l, --log-level <LEVEL>     Log level [default: info]
+      --cluster-driver <DRV>  local | sdcluster [default: local]
+      --seed <HOST:PORT>      Seed node (repeatable)
+```
+
+---
+
+## Cluster Membership
+
+### P2P TCP Mesh (`--cluster-driver sdcluster`)
+
+Built-in cluster membership with zero external dependencies. Replaces the C version's Corosync/ZooKeeper requirement.
+
+```
+  sheep:7000 ◄─────────────► sheep:7002
+  cluster:7001                cluster:7003
+      ▲  ╲                      ╱  ▲
+      │    ╲   Heartbeat(5s)  ╱    │
+      │      ╲  Join/Leave  ╱      │
+      ▼        ▼           ▼       ▼
               sheep:7004
               cluster:7005
 ```
 
-**Topology**: Full mesh — every node maintains a TCP connection to every other node.
-
 **How it works:**
 
-1. **Seed discovery**: New node connects to a seed, receives the full member list
-2. **Mesh expansion**: New node connects to every discovered member
-3. **Heartbeat**: Every 5 seconds, each node pings all peers
-4. **Failure detection**: If no heartbeat for 15 seconds, peer is declared dead
-5. **Leader election**: Node with the smallest `NodeId` (IP:port) is leader
-6. **Two-phase updates**: `Block` → pause all nodes → `Unblock` with result
+1. New node connects to a **seed**, receives member list
+2. New node opens TCP to **every** existing member (full mesh)
+3. **Heartbeat** every 5 seconds; peer declared dead after 15s silence
+4. **Leader** = node with smallest `NodeId` (IP:port)
+5. **Two-phase updates**: Leader sends `Block` → all pause → `Unblock` with result
 
 **Cluster messages:**
 
-| Message | Direction | Purpose |
-|---------|-----------|---------|
-| `Join { node }` | new → seed | Join request |
-| `JoinResponse { members }` | seed → new | Current member list |
-| `Leave { node }` | node → all | Graceful departure |
-| `Heartbeat { node }` | node ↔ node | Keepalive (5s) |
-| `Notify { data }` | leader → all | Broadcast (format, shutdown, alter-copy) |
-| `Block` | leader → all | Two-phase update phase 1 |
-| `Unblock { data }` | leader → all | Two-phase update phase 2 |
-| `Election { candidate }` | node → all | Leader election |
-| `ElectionResponse { leader }` | node → node | Election result |
+| Message | Purpose |
+|---------|---------|
+| `Join { node }` | Join request (new → seed) |
+| `JoinResponse { members }` | Member list (seed → new) |
+| `Leave { node }` | Graceful departure |
+| `Heartbeat { node }` | Keepalive (5s interval) |
+| `Notify { data }` | Broadcast (format, shutdown) |
+| `Block` / `Unblock { data }` | Two-phase atomic update |
+| `Election` / `ElectionResponse` | Leader election |
 
-**Wire format**: 4-byte little-endian length prefix + bincode-encoded `ClusterMessage`.
+### Local Driver (`--cluster-driver local`)
 
-### Local driver
+Single-node, in-process channel-based. Default for development.
 
-Single-node, in-process channel-based driver for development and testing. Selected by default (`--cluster-driver local`).
+---
 
-### Driver comparison
-
-| | `local` | `sdcluster` |
-|-|---------|-------------|
-| Use case | Development, testing | Production clusters |
-| Nodes | 1 | Unlimited |
-| Transport | In-process mpsc | TCP sockets |
-| Failure detection | N/A | Heartbeat (5s/15s) |
-| Leader election | Self | Deterministic (min NodeId) |
-| External deps | None | None |
-
-## Wire Protocol
-
-All sheepdog components communicate over TCP using a binary protocol:
-
-```
-+------------------+-----------------------------------+
-| u32 length       | bincode(RequestHeader, SdRequest) |
-+------------------+-----------------------------------+
-```
-
-| Protocol | Length prefix | Serialization | Port |
-|----------|-------------|---------------|------|
-| Client I/O | 4-byte **big-endian** | bincode | 7000 |
-| Cluster mesh | 4-byte **little-endian** | bincode | 7001 |
-| HTTP/S3 | HTTP/1.1 | JSON/binary | 8000 |
-| NFS v3 | ONC RPC record mark | XDR | 2049 |
-| NBD | Fixed newstyle + 28-byte request header | big-endian binary | 10809 |
+## Storage
 
 ### Object Addressing
 
-Each data object is identified by a 64-bit **Object ID (OID)**:
+Each sheepdog object has a 64-bit **Object ID**:
 
 ```
   63       56 55      32 31                 0
   +----------+----------+-------------------+
   |  flags   |  VDI ID  |   object index    |
   +----------+----------+-------------------+
+     8 bits    24 bits        32 bits
 ```
 
-- **VDI ID**: 24-bit virtual disk identifier (up to 16M VDIs)
-- **Object index**: 32-bit index within the VDI
-- **Object size**: 4 MB (`SD_DATA_OBJ_SIZE`)
-- **Max VDI size**: 16 EB (4 MB × 2³² objects)
+- **4 MB per object** (`SD_DATA_OBJ_SIZE`)
+- Up to **16M VDIs**, each up to **16 EB**
+- Objects placed on nodes via consistent hash of OID
 
-## HTTP/S3 API
+### Backends
 
-The sheep daemon exposes an S3-compatible HTTP API on port 8000 (default).
+| Backend | Path Layout | Use Case |
+|---------|-------------|----------|
+| `plain` | `obj/{oid_hex}` | Simple, flat directory |
+| `tree` | `obj/{vid_hex}/{oid_hex}` | Better for many VDIs |
+| `md` | Balanced across multiple disks | Production |
+
+### Caching & Journaling
+
+- **Object cache**: LRU eviction, backed by `dashmap` + `lru` crate
+- **Write-ahead journal**: Memory-mapped files via `memmap2`
+
+---
+
+## Server Interfaces
+
+### NBD Export (port 10809)
+
+Exports VDIs as block devices for QEMU and other NBD clients. Each VDI name is an NBD export.
+
+- **Protocol**: Fixed newstyle handshake (RFC-compliant)
+- **Options**: `LIST`, `GO`, `INFO`, `EXPORT_NAME`, `ABORT`
+- **Commands**: `READ`, `WRITE`, `FLUSH`, `TRIM`, `WRITE_ZEROES`, `DISC`
+- **Block size**: min=512, preferred=4MB, max=4MB
+- **Flags**: `HAS_FLAGS`, `SEND_FLUSH`, `SEND_TRIM`, `SEND_WRITE_ZEROES`, `CAN_MULTI_CONN`
 
 ```bash
-# List buckets
-curl http://localhost:8000/
-
-# Create a bucket
-curl -X PUT http://localhost:8000/my-bucket
-
-# Upload an object
-curl -X PUT http://localhost:8000/my-bucket/my-key -d "hello"
-
-# Download an object
-curl http://localhost:8000/my-bucket/my-key
-
-# Delete an object
-curl -X DELETE http://localhost:8000/my-bucket/my-key
+sheep --nbd /data/sheep
+qemu-nbd --list -k 127.0.0.1:10809         # List exports
+qemu-img info nbd://127.0.0.1:10809/mydisk  # Inspect
 ```
 
-**OpenStack Swift API** is also available under `/v1/{account}/`:
+### HTTP / S3 API (port 8000)
+
+S3-compatible object storage interface (feature-gated, enabled by default):
 
 ```bash
-curl http://localhost:8000/v1/AUTH_test/container/object
+curl http://localhost:8000/                         # List buckets
+curl -X PUT http://localhost:8000/mybucket           # Create bucket
+curl -X PUT http://localhost:8000/mybucket/key -d "data"  # Upload
+curl http://localhost:8000/mybucket/key               # Download
+curl -X DELETE http://localhost:8000/mybucket/key      # Delete
 ```
 
-## NFS v3
+OpenStack Swift API also available at `/v1/{account}/`.
 
-Export VDIs as NFS files (ONC RPC over TCP):
+### NFS v3 (port 2049)
+
+ONC RPC over TCP. Procedures: NULL, GETATTR, SETATTR, LOOKUP, READ, WRITE, CREATE, REMOVE, MKDIR, READDIR, FSSTAT, FSINFO, PATHCONF.
 
 ```bash
 sheep --nfs --nfs-port 2049 /data/sheep
 mount -t nfs -o port=2049,mountport=2050,nfsvers=3,tcp localhost:/ /mnt/sheep
 ```
 
-Implements: NULL, GETATTR, SETATTR, LOOKUP, READ, WRITE, CREATE, REMOVE, MKDIR, READDIR, FSSTAT, FSINFO, PATHCONF.
+---
 
-## NBD Export Server
+## Wire Protocol
 
-The sheep daemon includes an NBD (Network Block Device) server that exports VDIs as block devices. This allows QEMU and other NBD clients to connect directly — no native sheepdog block driver required.
+| Protocol | Encoding | Length Prefix | Default Port |
+|----------|----------|---------------|:------------:|
+| Client I/O | bincode | 4-byte BE | 7000 |
+| Cluster mesh | bincode | 4-byte LE | 7001 |
+| HTTP/S3 | HTTP/1.1 + JSON | — | 8000 |
+| NFS v3 | XDR / ONC RPC | RPC record mark | 2049 |
+| NBD | Big-endian binary | Fixed headers | 10809 |
 
-```bash
-# Start sheep with NBD
-sheep --nbd /data/sheep
-
-# List available exports
-qemu-nbd --list -k 127.0.0.1:10809
-
-# Use with QEMU
-qemu-system-x86_64 -drive file=nbd://127.0.0.1:10809/my-disk,format=raw,if=virtio ...
-
-# Read/write with qemu-io
-qemu-io -f raw -c "write -P 0xAB 0 4096" nbd://127.0.0.1:10809/my-disk
-qemu-io -f raw -c "read -P 0xAB 0 4096" nbd://127.0.0.1:10809/my-disk
-```
-
-**Protocol**: Fixed newstyle negotiation (RFC-compliant). Supports `NBD_OPT_LIST`, `NBD_OPT_GO`, `NBD_OPT_INFO`, `NBD_OPT_EXPORT_NAME`.
-
-**Commands**: `READ`, `WRITE`, `FLUSH`, `TRIM`, `WRITE_ZEROES`, `DISC`.
-
-**Export names**: Each VDI name is an export name. The default port is 10809 (IANA-reserved).
-
-| Wire format | Value |
-|-------------|-------|
-| Default port | 10809 |
-| Handshake | Fixed newstyle + NO_ZEROES |
-| Transmission flags | HAS_FLAGS, SEND_FLUSH, SEND_FUA, SEND_TRIM, SEND_WRITE_ZEROES, CAN_MULTI_CONN |
-| Block size | min=512, preferred=4MB (= SD_DATA_OBJ_SIZE), max=4MB |
+---
 
 ## Key Constants
 
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `SD_DATA_OBJ_SIZE` | 4 MB | Size of each data object |
-| `SD_LISTEN_PORT` | 7000 | Default daemon port |
-| `NBD_DEFAULT_PORT` | 10809 | Default NBD export port |
-| `SD_DEFAULT_COPIES` | 3 | Default replica count |
-| `SD_MAX_NODES` | 6144 | Maximum cluster nodes |
-| `SD_NR_VDIS` | 16M | Maximum VDI count |
-| `SD_DEFAULT_VNODES` | 128 | Virtual nodes per physical node |
-| `HEARTBEAT_INTERVAL` | 5s | Cluster heartbeat interval |
-| `HEARTBEAT_TIMEOUT` | 15s | Peer failure detection timeout |
-| `MAX_MESSAGE_SIZE` | 8 MB | Maximum cluster wire message size |
+| Constant | Value |
+|----------|-------|
+| `SD_DATA_OBJ_SIZE` | 4 MB |
+| `SD_LISTEN_PORT` | 7000 |
+| `NBD_DEFAULT_PORT` | 10809 |
+| `SD_DEFAULT_COPIES` | 3 |
+| `SD_MAX_NODES` | 6,144 |
+| `SD_NR_VDIS` | 16,777,216 |
+| `SD_DEFAULT_VNODES` | 128 |
+| `HEARTBEAT_INTERVAL` | 5 s |
+| `HEARTBEAT_TIMEOUT` | 15 s |
+
+---
 
 ## Feature Flags
 
-The `sheep` crate supports optional features:
-
-| Feature | Default | Description |
-|---------|---------|-------------|
-| `http` | yes | HTTP/S3 and Swift API (axum) |
-| `nfs` | no | NFS v3 server |
-
 ```bash
-# Build without HTTP
+# Default (includes HTTP/S3)
+cargo build -p sheep
+
+# Without HTTP
 cargo build -p sheep --no-default-features
 
-# Build with NFS
+# With NFS
 cargo build -p sheep --features nfs
+
+# sheepfs (requires system libfuse)
+cargo build -p sheepfs
 ```
 
-## Comparison with C Sheepdog
+| Feature | Default | Crate |
+|---------|:-------:|-------|
+| `http` | yes | sheep |
+| `nfs` | no | sheep |
 
-| Feature | C Sheepdog (v0.9.5) | sheepdog-rs (v0.10.0) |
-|---------|---------------------|----------------------|
+---
+
+## Differences from C Sheepdog
+
+| | C Sheepdog (v0.9.5) | sheepdog-rs (v0.10.0) |
+|-|---------------------|----------------------|
 | Language | C | Rust (async, memory-safe) |
-| Cluster membership | Corosync / ZooKeeper | Built-in P2P TCP mesh |
-| External dependencies | corosync, libcpg | None |
+| Codebase | ~60K LOC | ~16K LOC |
 | Async I/O | epoll + callbacks | tokio async/await |
-| Serialization | Custom binary structs | bincode + serde |
-| HTTP API | Custom HTTP parser | axum |
-| Leader election | Corosync CPG | Deterministic (min NodeId) |
-| Atomic updates | Corosync two-phase | Block/Unblock messages |
-| Codebase | ~60K LOC | ~15.5K LOC |
+| Cluster | Corosync / ZooKeeper | Built-in P2P TCP mesh |
+| External deps | corosync, libcpg | None |
+| Serialization | Hand-packed structs | bincode + serde |
+| HTTP server | Custom parser | axum |
+| QEMU attach | Native block driver | NBD export server |
+
+---
 
 ## Dependencies
 
-| Dependency | Purpose |
-|------------|---------|
-| [tokio](https://tokio.rs/) | Async runtime (full features) |
+| Crate | Purpose |
+|-------|---------|
+| [tokio](https://tokio.rs/) | Async runtime |
 | [serde](https://serde.rs/) + [bincode](https://docs.rs/bincode) | Serialization |
-| [clap](https://docs.rs/clap) | CLI argument parsing |
+| [clap](https://docs.rs/clap) | CLI parsing |
 | [tracing](https://docs.rs/tracing) | Structured logging |
-| [axum](https://docs.rs/axum) | HTTP/S3 server (optional) |
-| [fuser](https://docs.rs/fuser) | FUSE bindings (sheepfs only) |
-| [dashmap](https://docs.rs/dashmap) | Concurrent hash map (object cache) |
-| [memmap2](https://docs.rs/memmap2) | Memory-mapped I/O (journal) |
+| [axum](https://docs.rs/axum) | HTTP/S3 server |
+| [fuser](https://docs.rs/fuser) | FUSE bindings |
+| [dashmap](https://docs.rs/dashmap) | Concurrent hash map |
+| [memmap2](https://docs.rs/memmap2) | Memory-mapped I/O |
 | [reed-solomon-erasure](https://docs.rs/reed-solomon-erasure) | Erasure coding |
-| [bitvec](https://docs.rs/bitvec) | VDI usage bitmap |
-| [tabled](https://docs.rs/tabled) | Table formatting (dog CLI) |
-| [indicatif](https://docs.rs/indicatif) | Progress bars (dog CLI) |
+| [bitvec](https://docs.rs/bitvec) | VDI bitmap |
+| [tabled](https://docs.rs/tabled) | CLI table output |
+| [indicatif](https://docs.rs/indicatif) | Progress bars |
 
-## Project Status
+---
 
-Rust port of [C Sheepdog v0.9.5](https://github.com/sheepdog/sheepdog).
+## Status
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| Protocol types & constants | ✅ Complete | All request/response types, OID encoding |
-| Consistent hashing | ✅ Complete | Virtual node ring with zone awareness |
-| P2P cluster driver (sdcluster) | ✅ Complete | TCP mesh, heartbeat, leader election, two-phase |
-| Local cluster driver | ✅ Complete | Single-node with in-process channels |
-| Cluster event loop | ✅ Complete | Join/Leave/Notify/Block/Unblock dispatch |
-| Storage backends | ✅ Complete | plain, tree, md drivers |
-| Client request pipeline | ✅ Complete | Accept, dispatch, gateway forwarding |
-| Object replication | ✅ Complete | Synchronous multi-copy writes via hash ring |
-| Recovery worker | ✅ Complete | Background object migration on topology change |
-| Object cache | ✅ Complete | LRU with dashmap |
-| Write-ahead journal | ✅ Complete | Memory-mapped WAL (memmap2) |
-| HTTP/S3 API | ✅ Complete | axum-based S3-compatible interface |
-| OpenStack Swift API | ✅ Complete | Swift-compatible container/object interface |
-| NFS v3 server | ✅ Complete | ONC RPC framing + NFS3 procedures |
-| CLI tool (dog) | ✅ Complete | All subcommands: vdi, node, cluster, upgrade |
-| FUSE filesystem (sheepfs) | ✅ Complete | Mount VDIs as local files |
-| Cluster coordinator (shepherd) | ✅ Complete | Heartbeat monitoring + health status |
-| NBD export server | ✅ Complete | Fixed newstyle negotiation, READ/WRITE/FLUSH/TRIM |
-| Erasure coding | 🔶 Partial | reed-solomon-erasure integrated, wiring incomplete |
-| QEMU integration | ✅ Via NBD | `nbd://host:10809/vdi-name` (native driver removed from QEMU v6.0+) |
+| Component | Status |
+|-----------|:------:|
+| Protocol types & OID encoding | Done |
+| Consistent hashing (zone-aware) | Done |
+| P2P cluster driver | Done |
+| Local cluster driver | Done |
+| Cluster event loop | Done |
+| Storage backends (plain, tree, md) | Done |
+| Client request pipeline | Done |
+| Object replication | Done |
+| Recovery worker | Done |
+| Object cache + journal | Done |
+| HTTP/S3 API | Done |
+| Swift API | Done |
+| NFS v3 server | Done |
+| NBD export server | Done |
+| CLI tool (dog) | Done |
+| FUSE filesystem (sheepfs) | Done |
+| Cluster monitor (shepherd) | Done |
+| Erasure coding | Partial |
+
+---
 
 ## License
 
-GPL-2.0 — same as the original Sheepdog project.
+GPL-2.0 (same as original Sheepdog).
 
-## References
+## Links
 
 - [Sheepdog Project](https://sheepdog.github.io/sheepdog/)
 - [Sheepdog Wiki](https://github.com/sheepdog/sheepdog/wiki)
-- [QEMU Sheepdog Documentation](https://www.qemu.org/docs/master/system/devices/sheepdog.html)
+- [Original C Source](https://github.com/sheepdog/sheepdog)
