@@ -573,6 +573,7 @@ impl SdClusterDriver {
         event_tx: mpsc::Sender<ClusterEvent>,
         shutdown: Arc<Notify>,
         seed_addr: SocketAddr,
+        port_offset: u16,
     ) -> SdResult<Vec<SdNode>> {
         let stream = TcpStream::connect(seed_addr)
             .await
@@ -608,12 +609,13 @@ impl SdClusterDriver {
 
         // Register this seed as a peer.
         let peer_key = {
-            // Find the seed's SdNode in the members list (the one at seed_addr).
-            // If we cannot identify it, use the seed_addr as key.
+            // Find the seed's SdNode in the members list by matching both IP
+            // and port (node.port + port_offset == seed cluster port).
+            // IP-only matching is wrong when multiple nodes share the same IP
+            // (e.g. localhost testing with 127.0.0.1).
             let key_node = members.iter().find(|n| {
-                let naddr = n.nid.socket_addr();
-                // The seed might be on the cluster port, so check both.
-                naddr.ip() == seed_addr.ip()
+                n.nid.addr == seed_addr.ip()
+                    && n.nid.port + port_offset == seed_addr.port()
             });
             match key_node {
                 Some(n) => n.nid.to_string(),
@@ -626,9 +628,14 @@ impl SdClusterDriver {
         {
             let mut s = state.write().await;
             // Register the seed peer for the inbound reader half.
+            // Match by both IP and port (with offset) to avoid misidentifying
+            // peers when multiple nodes share the same IP address.
             let seed_node = members
                 .iter()
-                .find(|n| n.nid.socket_addr().ip() == seed_addr.ip())
+                .find(|n| {
+                    n.nid.addr == seed_addr.ip()
+                        && n.nid.port + port_offset == seed_addr.port()
+                })
                 .cloned()
                 .unwrap_or_else(|| this_node.clone());
 
@@ -876,6 +883,7 @@ impl ClusterDriver for SdClusterDriver {
                 self.event_tx.clone(),
                 self.shutdown.clone(),
                 *seed,
+                self.port_offset,
             )
             .await
             {
