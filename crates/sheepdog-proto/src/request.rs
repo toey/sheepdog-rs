@@ -118,6 +118,7 @@ pub enum SdRequest {
         ec_index: u8,
         copies: u8,
         copy_policy: u8,
+        offset: u32,
         data: Vec<u8>,
     },
     ReadPeer {

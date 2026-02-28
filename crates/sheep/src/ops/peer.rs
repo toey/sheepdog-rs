@@ -19,8 +19,9 @@ pub async fn handle(sys: SharedSys, request: Request) -> SdResult<ResponseResult
             ec_index,
             copies,
             copy_policy,
+            offset,
             data,
-        } => create_and_write(sys, oid, ec_index, copies, copy_policy, data).await,
+        } => create_and_write(sys, oid, ec_index, copies, copy_policy, offset, data).await,
 
         SdRequest::ReadPeer {
             oid,
@@ -67,18 +68,27 @@ pub async fn handle(sys: SharedSys, request: Request) -> SdResult<ResponseResult
 }
 
 /// Create a new object and write initial data.
+///
+/// Creates a full-size (SD_DATA_OBJ_SIZE = 4 MB) zero-filled object on disk,
+/// then writes the provided data at the given offset. This ensures that sparse
+/// writes (e.g., writing 4K at offset 1M in a new object) produce a correctly
+/// sized object with zeros in unwritten regions.
 async fn create_and_write(
     sys: SharedSys,
     oid: ObjectId,
     ec_index: u8,
     _copies: u8,
     _copy_policy: u8,
+    offset: u32,
     data: Vec<u8>,
 ) -> SdResult<ResponseResult> {
+    use sheepdog_proto::constants::SD_DATA_OBJ_SIZE;
+
     debug!(
-        "create_and_write: oid={:?}, ec_index={}, len={}",
+        "create_and_write: oid={:?}, ec_index={}, offset={}, len={}",
         oid,
         ec_index,
+        offset,
         data.len()
     );
 
@@ -94,12 +104,35 @@ async fn create_and_write(
             .map_err(|_| SdError::Eio)?;
     }
 
+    // Determine the full object size.
+    // For EC strips or inode objects the data may be smaller than 4MB,
+    // so only pad to SD_DATA_OBJ_SIZE for regular data objects.
+    let obj_size = if ec_index > 0 || !oid.is_data_obj() {
+        // EC strip or non-data object: use actual data size
+        (offset as usize) + data.len()
+    } else {
+        SD_DATA_OBJ_SIZE as usize
+    };
+
     // Write the object to disk (use spawn_blocking for filesystem I/O)
     let path = obj_path.clone();
     tokio::task::spawn_blocking(move || {
-        use std::io::Write;
+        use std::io::{Seek, SeekFrom, Write};
         let mut file = std::fs::File::create(&path).map_err(|_| SdError::Eio)?;
-        file.write_all(&data).map_err(|_| SdError::Eio)?;
+
+        if offset == 0 && data.len() >= obj_size {
+            // Fast path: data covers the entire object
+            file.write_all(&data).map_err(|_| SdError::Eio)?;
+        } else {
+            // Create a full-size zero-filled file, then write data at offset
+            file.set_len(obj_size as u64).map_err(|_| SdError::Eio)?;
+            if !data.is_empty() {
+                file.seek(SeekFrom::Start(offset as u64))
+                    .map_err(|_| SdError::Eio)?;
+                file.write_all(&data).map_err(|_| SdError::Eio)?;
+            }
+        }
+
         file.sync_all().map_err(|_| SdError::Eio)?;
         Ok::<_, SdError>(())
     })

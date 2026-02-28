@@ -249,6 +249,7 @@ async fn gateway_write_ec(
             ec_index,
             copies,
             copy_policy,
+            offset: 0,
             data: strip,
         };
 
@@ -361,6 +362,7 @@ async fn gateway_write_replicate(
                 ec_index: idx as u8,
                 copies,
                 copy_policy,
+                offset,
                 data: data.as_ref().clone(),
             }
         } else {

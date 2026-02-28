@@ -143,6 +143,33 @@ scripts/test-recovery.sh --keep
 | 4. Add node | New node 3 joins, epoch bumps |
 | 5. Rebalance | Verify data integrity after rebalance |
 
+### 7. I/O correctness test (no cache)
+
+Tests data integrity through the NBD path with object cache **disabled** — every I/O goes directly through the store layer:
+
+```bash
+# Run full I/O test suite
+scripts/test-io.sh
+
+# Keep data for inspection
+scripts/test-io.sh --keep
+
+# Skip the Direct I/O phase
+scripts/test-io.sh --skip-directio
+```
+
+**Test phases:**
+
+| Phase | What happens |
+|-------|-------------|
+| 1. Setup | 3-node cluster, no `--cache`, create VDI |
+| 2. Basic I/O | Sequential write + read (4K, 64K, 256K, 1M) at each object offset |
+| 3. Overwrite | Rewrite same locations with new patterns, partial overwrites |
+| 4. Cross-boundary | Writes spanning two 4MB objects (8K and 1M) |
+| 5. Large I/O | Multi-object sequential writes (8MB, 16MB, 32MB full VDI) |
+| 6. Sparse | Non-contiguous offsets, verify gaps read as zeros |
+| 7. Direct I/O | Restart with `--directio`, repeat key tests |
+
 ---
 
 ## Erasure Coding
@@ -285,7 +312,8 @@ sheepdog-rs/
 │   └── sheepfs/            554 LOC   FUSE filesystem (optional)
 ├── scripts/
 │   ├── cluster.sh          353 LOC   3-node cluster management
-│   └── test-recovery.sh    310 LOC   Recovery & rebalance test
+│   ├── test-recovery.sh    310 LOC   Recovery & rebalance test
+│   └── test-io.sh          350 LOC   I/O correctness test (no cache)
 └── Cargo.toml                        Workspace root (v0.10.0)
 ```
 

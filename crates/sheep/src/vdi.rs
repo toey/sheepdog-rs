@@ -127,6 +127,7 @@ pub async fn write_inode(
         ec_index: 0,
         copies: inode.nr_copies,
         copy_policy: inode.copy_policy,
+        offset: 0,
         data,
     };
 
