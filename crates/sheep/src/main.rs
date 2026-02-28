@@ -365,6 +365,32 @@ async fn main() {
         cluster_event_loop(sys_cluster, driver_for_loop).await;
     });
 
+    // ---------------------------------------------------------------
+    // Spawn recovery worker
+    // ---------------------------------------------------------------
+    if !args.gateway {
+        let recovery_store: Arc<dyn store::StoreDriver> =
+            Arc::new(store::plain::PlainStore::new());
+        // Try to init with existing layout; fall back to first-time init
+        if recovery_store.init(&args.dir, false).await.is_err() {
+            if let Err(e) = recovery_store.init(&args.dir, true).await {
+                error!("failed to init store for recovery: {}", e);
+                std::process::exit(1);
+            }
+        }
+
+        let recovery_shutdown = {
+            let s = sys.read().await;
+            s.shutdown_notify.clone()
+        };
+        let recovery_worker =
+            Arc::new(recovery::RecoveryWorker::new(sys.clone(), recovery_store));
+        tokio::spawn(async move {
+            recovery_worker.run(recovery_shutdown).await;
+        });
+        info!("recovery worker started");
+    }
+
     info!("sheep ready on {}", listen_addr);
 
     // Spawn the main services

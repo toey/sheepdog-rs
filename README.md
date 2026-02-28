@@ -121,6 +121,28 @@ scripts/cluster.sh clean
 
 Options: `--nbd`, `--nfs`, `--format`, `--copies N`, `--http`.
 
+### 6. Recovery test
+
+A test script validates node failure, recovery, and rebalance:
+
+```bash
+# Run full recovery test (automatic cleanup)
+scripts/test-recovery.sh
+
+# Keep data for inspection
+scripts/test-recovery.sh --keep
+```
+
+**Test flow:**
+
+| Phase | What happens |
+|-------|-------------|
+| 1. Setup | Start 3-node cluster, write data via NBD |
+| 2. Kill | SIGKILL node 2 (crash simulation) |
+| 3. Recovery | Cluster detects failure (~15s), data still readable (2-copy) |
+| 4. Add node | New node 3 joins, epoch bumps |
+| 5. Rebalance | Verify data integrity after rebalance |
+
 ---
 
 ## Erasure Coding
@@ -262,7 +284,8 @@ sheepdog-rs/
 │   ├── sheepdog-dpdk/      560 LOC   DPDK data plane (optional)
 │   └── sheepfs/            554 LOC   FUSE filesystem (optional)
 ├── scripts/
-│   └── cluster.sh          353 LOC   3-node cluster management
+│   ├── cluster.sh          353 LOC   3-node cluster management
+│   └── test-recovery.sh    310 LOC   Recovery & rebalance test
 └── Cargo.toml                        Workspace root (v0.10.0)
 ```
 
