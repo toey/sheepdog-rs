@@ -28,6 +28,7 @@ memmap2 = "0.9"
 bitvec = "1"
 lru = "0.7"
 rand = "0.8"
+iscsi-target = "1.0.0"
 
 [features]
 default = ["http"]

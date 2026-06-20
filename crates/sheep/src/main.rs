@@ -20,6 +20,7 @@ mod daemon;
 mod group;
 #[cfg(feature = "http")]
 mod http;
+mod iscsi;
 mod journal;
 mod migrate;
 mod nbd;
