@@ -2,6 +2,7 @@
 //!
 //! Saves/loads cluster info and epoch logs to disk so that a restarting
 //! node can rejoin with the correct epoch.
+#![allow(dead_code)]
 
 use std::path::Path;
 
@@ -155,25 +156,41 @@ impl IscsiAuthConfig {
     /// Convert to iscsi_target::AuthConfig.
     pub fn to_auth_config(&self) -> iscsi_target::AuthConfig {
         match self.auth_type.as_deref() {
-            Some("chap") => iscsi_target::AuthConfig::Chap {
-                credentials: iscsi_target::ChapCredentials::new(
-                    self.username.as_deref().unwrap_or("default"),
-                    self.secret.as_deref().unwrap_or(""),
-                ),
+            Some("chap") => {
+                let username = self.username.as_deref().unwrap_or("default");
+                let secret = self.secret.as_deref().unwrap_or_default();
+                if secret.is_empty() {
+                    tracing::warn!("CHAP secret is empty for target, using empty string");
+                }
+                iscsi_target::AuthConfig::Chap {
+                    credentials: iscsi_target::ChapCredentials::new(username, secret),
+                }
             },
-            Some("mutual_chap") => iscsi_target::AuthConfig::MutualChap {
-                target_credentials: iscsi_target::ChapCredentials::new(
-                    self.target_username.as_deref().unwrap_or("default"),
-                    self.secret.as_deref().unwrap_or(""),
-                ),
-                initiator_credentials: iscsi_target::ChapCredentials::new(
-                    self.username.as_deref().unwrap_or("initiator"),
-                    self.initiator_secret.as_deref().unwrap_or(""),
-                ),
+            Some("mutual_chap") => {
+                let target_username = self.target_username.as_deref().unwrap_or("default");
+                let target_secret = self.secret.as_deref().unwrap_or_default();
+                let initiator_username = self.username.as_deref().unwrap_or("initiator");
+                let initiator_secret = self.initiator_secret.as_deref().unwrap_or_default();
+
+                if target_secret.is_empty() || initiator_secret.is_empty() {
+                    tracing::warn!("Mutual CHAP: one or more secrets are empty");
+                }
+
+                iscsi_target::AuthConfig::MutualChap {
+                    target_credentials: iscsi_target::ChapCredentials::new(target_username, target_secret),
+                    initiator_credentials: iscsi_target::ChapCredentials::new(initiator_username, initiator_secret),
+                }
             },
             _ => iscsi_target::AuthConfig::None,
         }
     }
+}
+
+/// Full TOML config file format.
+#[derive(Deserialize, Default, Clone, Debug)]
+pub struct TomlConfig {
+    #[serde(default)]
+    pub iscsi: IscsiConfig,
 }
 
 /// iSCSI daemon configuration.

@@ -152,6 +152,18 @@ struct Args {
     #[arg(long)]
     dpdk: bool,
 
+    /// Enable iSCSI target server
+    #[arg(long)]
+    iscsi: bool,
+
+    /// iSCSI listen address (default: 0.0.0.0:3260)
+    #[arg(long, default_value = "0.0.0.0:3260")]
+    iscsi_addr: String,
+
+    /// Path to config file
+    #[arg(short = 'c', long, default_value = "")]
+    config: PathBuf,
+
     /// DPDK EAL arguments (e.g. "-l 0-3 -n 4 --file-prefix sheep")
     #[arg(long, default_value = "")]
     dpdk_eal_args: String,
@@ -401,6 +413,51 @@ async fn main() {
 
     info!("sheep ready on {}", listen_addr);
 
+    // ---------------------------------------------------------------
+    // Capture tokio runtime handle before spawning servers
+    // ---------------------------------------------------------------
+    let handle = tokio::runtime::Handle::current();
+
+    // ---------------------------------------------------------------
+    // Start optional iSCSI server
+    // ---------------------------------------------------------------
+    // Load config to get iSCSI settings
+    let config_path: &std::path::Path = if args.config.as_os_str().is_empty() {
+        std::path::Path::new("sheepdog.conf")
+    } else {
+        args.config.as_path()
+    };
+    let config_content = std::fs::read_to_string(config_path).unwrap_or_default();
+    let toml_config: Result<crate::config::TomlConfig, _> = toml::from_str(&config_content);
+    
+    let iscsi_config = crate::config::IscsiConfig {
+        enabled: args.iscsi || toml_config.as_ref().map(|c| c.iscsi.enabled).unwrap_or(false),
+        listen_address: if args.iscsi_addr != "0.0.0.0:3260" {
+            args.iscsi_addr.clone()
+        } else {
+            toml_config.as_ref().map(|c| c.iscsi.listen_address.clone()).unwrap_or_else(|_| "0.0.0.0:3260".to_string())
+        },
+        luns: if args.iscsi && toml_config.as_ref().map(|c| c.iscsi.luns.is_empty()).unwrap_or(true) {
+            // CLI override: single LUN for VID 0
+            vec![crate::config::LunConfig {
+                target_name: "iqn.2024-06.com.sheepdog:volume".to_string(),
+                vid: 0,
+                size: 0,
+                ..Default::default()
+            }]
+        } else {
+            toml_config.as_ref().map(|c| c.iscsi.luns.clone()).unwrap_or_default()
+        },
+    };
+    let mut iscsi_server: Option<crate::iscsi::IscsiServer> = if iscsi_config.enabled && !iscsi_config.luns.is_empty() {
+        Some(crate::iscsi::start_iscsi_server(sys.clone(), iscsi_config, handle.clone()).unwrap_or_else(|e| {
+            error!("iSCSI server failed to start: {}", e);
+            crate::iscsi::IscsiServer { targets: Vec::new() }
+        }))
+    } else {
+        None
+    };
+
     // Spawn the main services
     let sys_accept = sys.clone();
     tokio::spawn(async move {
@@ -469,6 +526,11 @@ async fn main() {
     // Leave the cluster gracefully
     if let Err(e) = cluster_driver.leave().await {
         warn!("cluster leave failed: {}", e);
+    }
+
+    // Shut down the iSCSI server (blocking — runs on OS threads)
+    if let Some(ref mut srv) = iscsi_server {
+        srv.shutdown_all();
     }
 
     {

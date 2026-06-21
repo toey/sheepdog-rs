@@ -38,4 +38,5 @@ clap = { version = "4", features = ["derive"] }
 bytes = "1"
 dashmap = "6"
 sha1 = "0.10"
+toml = "0.8"
 crossbeam-channel = "0.5"

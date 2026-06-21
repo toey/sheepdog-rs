@@ -91,7 +91,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_cross_object_boundary() {
         // LBA 8190, 4 blocks → spans objects 0 and 1
         // Object 0: bytes 4193280-4194303 (2 blocks, 1024 bytes)
