@@ -147,11 +147,11 @@ async fn new_vdi(
     sys: SharedSys,
     name: &str,
     vdi_size: u64,
-    base_vid: u32,
+    _base_vid: u32,
     copies: u8,
     copy_policy: u8,
     _store_policy: u8,
-    snap_id: u32,
+    _snap_id: u32,
     _vdi_type: u32,
 ) -> SdResult<ResponseResult> {
     let mut s = sys.write().await;

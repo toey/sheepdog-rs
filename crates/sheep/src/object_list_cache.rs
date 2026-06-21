@@ -6,6 +6,7 @@
 //!
 //! The cache is typically populated during recovery preparation and
 //! invalidated when objects are added or removed.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::RwLock;

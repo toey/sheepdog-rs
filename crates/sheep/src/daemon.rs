@@ -1,6 +1,7 @@
 //! System-wide daemon state.
 //!
 //! In the C version this was a single global `struct system_info *sys`.
+#![allow(dead_code)]
 //! In Rust, we wrap it in `Arc<RwLock<>>` and pass explicitly.
 
 use std::collections::BTreeMap;

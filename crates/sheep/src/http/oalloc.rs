@@ -6,10 +6,12 @@
 
 use std::collections::BTreeSet;
 
-use sheepdog_proto::error::{SdError, SdResult};
 use tracing::debug;
 
+use sheepdog_proto::error::{SdError, SdResult};
+
 /// Object allocator for a single bucket/VDI.
+#[allow(dead_code)]
 pub struct ObjectAllocator {
     /// VDI ID this allocator manages.
     vid: u32,
@@ -21,6 +23,7 @@ pub struct ObjectAllocator {
     next_idx: u32,
 }
 
+#[allow(dead_code)]
 impl ObjectAllocator {
     /// Create a new allocator for a VDI with the given number of data slots.
     pub fn new(vid: u32, total_slots: u32) -> Self {

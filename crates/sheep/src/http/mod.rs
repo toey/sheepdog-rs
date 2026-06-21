@@ -24,7 +24,7 @@ use std::sync::Arc;
 #[cfg(feature = "http")]
 use axum::{
     Router,
-    routing::{delete, get, head, put},
+    routing::get,
     extract::State,
     response::IntoResponse,
     http::StatusCode,

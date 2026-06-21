@@ -5,6 +5,7 @@
 //!
 //! Migration is performed object-by-object, reading from the source store
 //! and writing to the destination store. Progress is reported via a callback.
+#![allow(dead_code)]
 
 use sheepdog_proto::error::{SdError, SdResult};
 use sheepdog_proto::oid::ObjectId;

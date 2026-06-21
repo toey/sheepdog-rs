@@ -3,6 +3,7 @@
 //! The `StoreDriver` trait defines the interface that all storage backends
 //! must implement. Each backend stores objects as files on disk, but
 //! differs in directory layout and organization strategy.
+#![allow(dead_code)]
 //!
 //! Available backends:
 //! - **plain**: flat directory layout `{base}/obj/{oid_hex}`

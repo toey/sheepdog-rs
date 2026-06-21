@@ -2,6 +2,7 @@
 //!
 //! Provides utilities for:
 //! - Computing object file paths from OIDs
+#![allow(dead_code)]
 //! - Atomic file writes (write-to-tmp then rename)
 //! - Scanning directories for stored objects
 //! - Checking available disk space

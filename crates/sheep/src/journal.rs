@@ -1,6 +1,7 @@
 //! Write-ahead journal using memory-mapped files.
 //!
 //! The journal provides crash recovery for the object store. Before any
+#![allow(dead_code)]
 //! write reaches the backing store, it is first appended to the journal.
 //! On startup after an unclean shutdown, the journal is replayed to
 //! reconstruct any writes that were in-flight.

@@ -10,7 +10,6 @@ use sheepdog_proto::error::{SdError, SdResult};
 use sheepdog_proto::hash::sd_hash;
 use sheepdog_proto::oid::ObjectId;
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
 
 /// Bucket metadata.
 #[derive(Debug, Clone)]
@@ -20,6 +19,7 @@ pub struct Bucket {
     /// Bucket name.
     pub name: String,
     /// Creation time (epoch seconds).
+    #[allow(dead_code)]
     pub created: u64,
 }
 

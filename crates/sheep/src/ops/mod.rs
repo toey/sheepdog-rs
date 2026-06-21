@@ -1,6 +1,7 @@
 //! Operation dispatch — replaces the C `sd_op_template[]` array.
 //!
 //! In the C version, each opcode mapped to a `sd_op_template` struct with
+#![allow(dead_code)]
 //! `process_work` and `process_main` function pointers. We replace that with
 //! a `match` on the `SdRequest` enum — much more type-safe.
 

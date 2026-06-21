@@ -1,6 +1,7 @@
 //! NFS filesystem abstraction layer.
 //!
 //! Maps NFS operations to sheepdog VDI data operations.
+#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 

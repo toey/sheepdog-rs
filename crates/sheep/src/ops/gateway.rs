@@ -298,13 +298,9 @@ async fn gateway_write_ec_partial(
 ) -> SdResult<ResponseResult> {
     // Get VDI size to know the full object size
     let obj_size = {
-        let s = sys.read().await;
-        let vid = oid.to_vid();
-        if let Some(state) = s.vdi_state.get(&vid) {
-            sheepdog_proto::constants::SD_DATA_OBJ_SIZE as usize
-        } else {
-            sheepdog_proto::constants::SD_DATA_OBJ_SIZE as usize
-        }
+        let _s = sys.read().await;
+        let _vid = oid.to_vid();
+        sheepdog_proto::constants::SD_DATA_OBJ_SIZE as usize
     };
 
     // Read the full object first (will reconstruct from EC strips)
@@ -409,7 +405,7 @@ async fn gateway_read(
     offset: u32,
     length: u32,
 ) -> SdResult<ResponseResult> {
-    let (copies, copy_policy) = get_vdi_copies(&sys, oid).await?;
+    let (_copies, copy_policy) = get_vdi_copies(&sys, oid).await?;
 
     if is_erasure_coding(copy_policy) {
         // EC read: collect strips and reconstruct
@@ -428,7 +424,7 @@ async fn gateway_read_ec(
     offset: u32,
     length: u32,
 ) -> SdResult<Vec<u8>> {
-    let (copies, copy_policy) = get_vdi_copies(&sys, oid).await?;
+    let (_copies, copy_policy) = get_vdi_copies(&sys, oid).await?;
     let (d, p) = fec::ec_policy_to_dp(copy_policy);
     let total = d + p;
 

@@ -1,6 +1,7 @@
 //! NFS MOUNT protocol handler.
 //!
 //! The MOUNT protocol is used by NFS clients to discover exports
+#![allow(dead_code)]
 //! and obtain initial file handles for mounting.
 
 use sheepdog_proto::error::{SdError, SdResult};

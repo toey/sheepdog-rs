@@ -6,6 +6,7 @@
 //!
 //! In Rust we use tokio tasks instead of epoll + work queues:
 //!   accept_loop → spawn(handle_client) → read_request → dispatch → respond
+#![allow(dead_code)]
 
 use sheepdog_proto::error::{SdError, SdResult};
 use sheepdog_proto::request::{RequestHeader, SdRequest, SdResponse, ResponseResult};

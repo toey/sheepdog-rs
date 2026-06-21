@@ -9,6 +9,7 @@
 //! - `dashmap` for concurrent access from multiple async tasks
 //! - `lru::LruCache` for eviction ordering (wrapped in a mutex)
 //! - A background flush task that periodically writes dirty entries
+#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;

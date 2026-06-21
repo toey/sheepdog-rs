@@ -1,6 +1,7 @@
 //! Cluster membership and epoch management.
 //!
 //! Manages node join/leave events, epoch transitions, and cluster state
+#![allow(dead_code)]
 //! consistency. In the C version this was `group.c` (~1,400 lines).
 //!
 //! Key concepts:
@@ -179,7 +180,7 @@ pub async fn find_node(sys: &SharedSys, nid: &str) -> Option<SdNode> {
 }
 
 /// Build initial cluster info for a fresh start.
-pub fn initial_cluster_info(this_node: &SdNode) -> SdResult<()> {
+pub fn initial_cluster_info(_this_node: &SdNode) -> SdResult<()> {
     // The cluster starts in WaitForFormat state.
     // The first `dog cluster format` command will transition it to Ok.
     Ok(())

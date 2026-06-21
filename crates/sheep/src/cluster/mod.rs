@@ -7,6 +7,7 @@
 //! Two implementations are provided:
 //! - `local`: single-node in-process driver for testing/development.
 //! - `sdcluster`: TCP mesh P2P driver for production multi-node clusters.
+#![allow(dead_code)]
 
 use async_trait::async_trait;
 use sheepdog_proto::error::SdResult;

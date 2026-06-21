@@ -1,6 +1,7 @@
 //! Multi-disk (md) management.
 //!
 //! Manages multiple physical disks attached to a single sheep node.
+#![allow(dead_code)]
 //! Objects are distributed across disks based on available free space
 //! using weighted random selection.
 //!
