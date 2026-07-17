@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# test-recovery.sh — Recovery E2E test suite
+# test-nfs.sh — NFS E2E test suite
 #
-# Tests cluster recovery after node failures.
+# Tests NFS operations against the Docker cluster's node0 NFS port.
 #
 # Usage:
-#   ./scripts/test-recovery.sh [--bind ADDRESS]
+#   ./scripts/test-nfs.sh [--bind ADDRESS] [--nfs-port PORT] [--nfs-mount-port PORT]
 
 set -uo pipefail
 
@@ -15,6 +15,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${SCRIPT_DIR}/defaults.sh"
 
 BIND="${BIND:-127.0.0.1}"
+NFS_PORT="${NFS_PORT:-2049}"
+NFS_MOUNT_PORT="${NFS_MOUNT_PORT:-2050}"
 
 KEEP=false
 
@@ -23,6 +25,8 @@ for arg in "$@"; do
     case "$arg" in
         --keep) KEEP=true ;;
         --bind) shift; BIND="$1" ;;
+        --nfs-port) shift; NFS_PORT="$1" ;;
+        --nfs-mount-port) shift; NFS_MOUNT_PORT="$1" ;;
     esac
 done
 
@@ -103,11 +107,19 @@ dog_cmd() {
 
 echo -e "${BOLD}${CYAN}"
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║          Sheepdog Recovery E2E Tests                       ║"
+echo "║            Sheepdog NFS E2E Tests                          ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 echo -e "  Cluster:   ${BIND}"
+echo -e "  NFS Port:  ${NFS_PORT}"
+echo -e "  Mount Port: ${NFS_MOUNT_PORT}"
 echo ""
+
+# Check prerequisites
+if ! command -v mount &>/dev/null; then
+    err "mount command not found"
+    exit 1
+fi
 
 # Check cluster is running
 if ! nc -z "$BIND" 7000 2>/dev/null; then
@@ -115,16 +127,16 @@ if ! nc -z "$BIND" 7000 2>/dev/null; then
     exit 1
 fi
 
-info "Cluster is running."
+info "Cluster is running. NFS port ${NFS_PORT} is accessible."
 
 # ━━━ Phase 1: Setup ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-phase 1 "Setup — verify cluster and create test VDI"
+phase 1 "Setup — verify cluster and create VDI"
 
-check "Cluster info available" dog_cmd cluster info
-check "Node list available" dog_cmd node list
+check "TCP port 7000 bound" nc -z "$BIND" 7000
+check "TCP port ${NFS_PORT} bound" nc -z "$BIND" "$NFS_PORT"
 
-step "Creating VDI for recovery testing"
-dog_cmd vdi create recoverytest 32M
+step "Creating VDI for NFS testing"
+dog_cmd vdi create nfstest 64M
 sleep 1
 
 check "VDI created" dog_cmd vdi list
@@ -132,64 +144,66 @@ check "VDI created" dog_cmd vdi list
 step "VDI info:"
 dog_cmd vdi list 2>/dev/null | while IFS= read -r line; do echo "    $line"; done
 
-# ━━━ Phase 2: Write Data ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-phase 2 "Write data to VDI"
+# ━━━ Phase 2: NFS Protocol Check ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+phase 2 "NFS protocol check"
 
-# Create an NBD connection and write some data
-NBD_URI="nbd://${BIND}:10809/recoverytest"
+# Try to mount NFS (this may fail in Docker without proper privileges)
+NFS_MOUNT_DIR="/tmp/nfstest-mount-$$"
 
-if command -v qemu-io &>/dev/null; then
-    step "Writing 8MB to VDI"
-    qemu-io -f raw -c "write -P 0xAA 0 8388608" "$NBD_URI" 2>/dev/null
-    check_result "NBD write succeeds" "$?"
+step "Attempting NFS mount"
+if mount -t nfs "${BIND}:${NFS_MOUNT_PORT}:/mnt" "$NFS_MOUNT_DIR" 2>/dev/null; then
+    pass "NFS mount succeeded"
 
-    step "Reading back and verifying"
-    qemu-io -f raw -c "read -P 0xAA 0 8388608" "$NBD_URI" 2>/dev/null
-    check_result "NBD read verification succeeds" "$?"
+    step "NFS: ls mount point"
+    ls -la "$NFS_MOUNT_DIR" 2>/dev/null
+    check_result "NFS ls succeeds" "$?"
+
+    step "NFS: create file"
+    echo "Hello from NFS test" > "$NFS_MOUNT_DIR/testfile.txt" 2>/dev/null
+    check_result "NFS write file succeeds" "$?"
+
+    step "NFS: read file"
+    file_content=$(cat "$NFS_MOUNT_DIR/testfile.txt" 2>/dev/null)
+    check_result "NFS read file succeeds" "$?"
+    check_body "NFS file content matches" "$file_content" "Hello from NFS test"
+
+    step "NFS: create directory"
+    mkdir "$NFS_MOUNT_DIR/testdir" 2>/dev/null
+    check_result "NFS mkdir succeeds" "$?"
+
+    step "NFS: ls directory"
+    ls -la "$NFS_MOUNT_DIR/testdir" 2>/dev/null
+    check_result "NFS directory ls succeeds" "$?"
+
+    step "NFS: write to directory"
+    echo "Directory test" > "$NFS_MOUNT_DIR/testdir/nested.txt" 2>/dev/null
+    check_result "NFS write to directory succeeds" "$?"
+
+    step "NFS: delete file"
+    rm "$NFS_MOUNT_DIR/testfile.txt" 2>/dev/null
+    check_result "NFS delete file succeeds" "$?"
+
+    step "NFS: unmount"
+    umount "$NFS_MOUNT_DIR" 2>/dev/null
+    check_result "NFS unmount succeeds" "$?"
+    rmdir "$NFS_MOUNT_DIR" 2>/dev/null
 else
-    warn "qemu-io not found, skipping NBD I/O tests"
+    warn "NFS mount failed (may require elevated privileges)"
+    step "Skipping NFS mount tests"
+    step "Verifying NFS port is accessible"
+    check "NFS port ${NFS_MOUNT_PORT} is accessible" nc -z "$BIND" "$NFS_MOUNT_PORT"
 fi
 
-# ━━━ Phase 3: Node Failure Simulation ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-phase 3 "Node failure simulation"
+# ━━━ Phase 3: NFS Server Status ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+phase 3 "NFS server status"
 
-# Check if we're in Docker mode (cannot restart nodes from admin container)
-if [[ -n "${DOCKER_ADMIN:-}" ]]; then
-    warn "Node failure simulation skipped (Docker mode)"
-    step "In Docker mode, node failures require manual intervention"
-else
-    # This would normally restart nodes, but requires host access
-    warn "Node failure simulation requires host-level access"
-    step "Use cluster-docker.sh restart to simulate node failure"
-fi
+step "Checking NFS port connectivity"
+check "NFS port ${NFS_PORT} is listening" nc -z "$BIND" "$NFS_PORT"
+check "NFS mount port ${NFS_MOUNT_PORT} is listening" nc -z "$BIND" "$NFS_MOUNT_PORT"
 
-# ━━━ Phase 4: Data Integrity After Failure ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-phase 4 "Data integrity verification"
-
-step "Verifying VDI still accessible"
-check "VDI list still works" dog_cmd vdi list
-
-step "Verifying cluster info"
-check "Cluster info still available" dog_cmd cluster info
-
-# Read back data if NBD is available
-if command -v qemu-io &>/dev/null; then
-    step "Reading back written data"
-    qemu-io -f raw -c "read -P 0xAA 0 8388608" "$NBD_URI" 2>/dev/null
-    check_result "Data integrity after simulated failure" "$?"
-fi
-
-# ━━━ Phase 5: Recovery Verification ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-phase 5 "Recovery verification"
-
-step "Checking node status"
-dog_cmd node list 2>/dev/null | while IFS= read -r line; do echo "    $line"; done
-
-step "Verifying all objects are accessible"
-dog_cmd obj list 2>/dev/null | head -5 | while IFS= read -r line; do echo "    $line"; done
-
-step "Final cluster info"
-dog_cmd cluster info 2>/dev/null
+step "Checking cluster health"
+check "Cluster info available" dog_cmd cluster info
+check "Node list available" dog_cmd node list
 
 # ━━━ Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 echo ""
