@@ -1,0 +1,16 @@
+## github.com/sheepdog/sheepdog
+git module sheepdog:
+  url: https://github.com/sheepdog/sheepdog
+  rev: stable-1.0
+
+## github.com/lawless-m/iscsi-crate
+git module iscsi:
+  url: https://github.com/lawless-m/iscsi-crate
+  rev: master
+
+
+#https://www.ietf.org/archive/id/draft-haynes-nfsv4-flexfiles-v2-00.html
+
+imports:
+  sheepdog: .llm/knowledge/sheepdog/
+  iscsi: .llm/knowledge/iscsi-crate/
