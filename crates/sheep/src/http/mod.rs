@@ -97,6 +97,7 @@ mod tests {
     use sheepdog_core::transport::{PeerListener, PeerTransport};
 
     use super::*;
+    use crate::cluster::local::LocalDriver;
     use crate::daemon::SystemInfo;
 
     // ---------------------------------------------------------------------------
@@ -149,11 +150,13 @@ mod tests {
         ));
         // Build a fully configured SystemInfo before wrapping in Arc<RwLock>
         // so no blocking write is needed at runtime (avoids tokio runtime deadlock).
+        let cluster_driver = Arc::new(LocalDriver::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7001)));
         let mut sys_inner = SystemInfo::new(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7001),
             dir,
             this_node.clone(),
             Arc::new(MockPeerTransport),
+            cluster_driver,
         );
         sys_inner.cinfo.status = ClusterStatus::Ok;
         sys_inner.cinfo.epoch = 1;
@@ -273,13 +276,17 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             7000,
         ));
-        // Create SharedSys WITHOUT formatting the cluster — default status is WaitForFormat
-        let sys = Arc::new(tokio::sync::RwLock::new(SystemInfo::new(
+        // Create SharedSys WITHOUT formatting the cluster — status is WaitForFormat
+        let cluster_driver = Arc::new(LocalDriver::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7001)));
+        let mut sys_inner = SystemInfo::new(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7001),
             dir.path().to_path_buf(),
             this_node,
             Arc::new(MockPeerTransport),
-        )));
+            cluster_driver,
+        );
+        sys_inner.cinfo.status = ClusterStatus::WaitForFormat;
+        let sys = Arc::new(tokio::sync::RwLock::new(sys_inner));
         let kv = Arc::new(kv::KvStore::new());
         let server = start_test_server(sys, kv).await;
         let url = base_url(&server);

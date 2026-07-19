@@ -3,14 +3,23 @@
 //! The `StoreDriver` trait defines the interface that all storage backends
 //! must implement. Each backend stores objects as files on disk, but
 //! differs in directory layout and organization strategy.
-#![allow(dead_code)]
 //!
 //! Available backends:
 //! - **plain**: flat directory layout `{base}/obj/{oid_hex}`
 //! - **tree**: hierarchical layout `{base}/obj/{vid_hex}/{oid_hex}`
 //!
-//! The `md` module manages multiple disks, distributing objects across
-//! them based on available free space.
+//! Multi-disk backends (using the `md` module):
+//! These backends manage multiple disks, distributing objects across them
+//! based on available free space.
+//! - **md**: distributes objects across multiple disks using the **plain**
+//!   flat directory layout (`{base}/diskX/obj/{oid_hex}`). Use this for
+//!   simpler layouts where VDI ID (vid) is not needed in the path.
+//! - **md-tree**: distributes objects across multiple disks using the **tree**
+//!   hierarchical layout (`{base}/diskX/obj/{vid_hex}/{oid_hex}`). Use this
+//!   when you want to group objects by VDI for better organization or
+//!   performance on multi-disk setups.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use sheepdog_proto::error::SdResult;
@@ -66,13 +75,52 @@ pub fn get_driver(name: &str) -> Option<Box<dyn StoreDriver>> {
     match name {
         "plain" => Some(Box::new(plain::PlainStore::new())),
         "tree" => Some(Box::new(tree::TreeStore::new())),
+        "md" => Some(Box::new(md::MdStore::new(Arc::new(md::MdManager::new("plain"))))),
+        "md-tree" => Some(Box::new(md::MdStore::new(Arc::new(md::MdManager::new("tree"))))),
         _ => None,
     }
 }
 
 /// List all available store driver names.
 pub fn available_drivers() -> Vec<&'static str> {
-    vec!["plain", "tree"]
+    vec!["plain", "tree", "md", "md-tree"]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_available_drivers_contains_md() {
+        let drivers = available_drivers();
+        assert!(drivers.contains(&"md"));
+        assert!(drivers.contains(&"md-tree"));
+        assert!(drivers.contains(&"plain"));
+        assert!(drivers.contains(&"tree"));
+        assert_eq!(drivers.len(), 4);
+    }
+
+    #[test]
+    fn test_get_driver_md() {
+        let driver = get_driver("md");
+        assert!(driver.is_some());
+        let driver = driver.unwrap();
+        assert_eq!(driver.name(), "md-plain");
+    }
+
+    #[test]
+    fn test_get_driver_md_tree() {
+        let driver = get_driver("md-tree");
+        assert!(driver.is_some());
+        let driver = driver.unwrap();
+        assert_eq!(driver.name(), "md-tree");
+    }
+
+    #[test]
+    fn test_get_driver_unknown_returns_none() {
+        let driver = get_driver("nonexistent");
+        assert!(driver.is_none());
+    }
 }
 
 pub mod common;

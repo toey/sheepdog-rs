@@ -92,18 +92,6 @@ async fn create_and_write(
         data.len()
     );
 
-    let obj_path = {
-        let s = sys.read().await;
-        get_obj_path(&s, oid, ec_index)
-    };
-
-    // Create parent directories if needed
-    if let Some(parent) = obj_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|_| SdError::Eio)?;
-    }
-
     // Determine the full object size.
     // For EC strips or inode objects the data may be smaller than 4MB,
     // so only pad to SD_DATA_OBJ_SIZE for regular data objects.
@@ -114,30 +102,30 @@ async fn create_and_write(
         SD_DATA_OBJ_SIZE as usize
     };
 
-    // Write the object to disk (use spawn_blocking for filesystem I/O)
-    let path = obj_path.clone();
-    tokio::task::spawn_blocking(move || {
-        use std::io::{Seek, SeekFrom, Write};
-        let mut file = std::fs::File::create(&path).map_err(|_| SdError::Eio)?;
-
-        if offset == 0 && data.len() >= obj_size {
-            // Fast path: data covers the entire object
-            file.write_all(&data).map_err(|_| SdError::Eio)?;
+    // Prepare data with correct padding for store's create_and_write.
+    // The store interface writes data at offset 0, so we need to pad/shift
+    // the data to match the expected layout.
+    let prepared_data = if offset == 0 && data.len() >= obj_size {
+        // Fast path: data already covers the entire object
+        data
+    } else {
+        // Create a zero-filled buffer of obj_size, then write data at offset
+        let mut buf = vec![0u8; obj_size];
+        if offset as usize + data.len() <= buf.len() {
+            buf[offset as usize..offset as usize + data.len()].copy_from_slice(&data);
         } else {
-            // Create a full-size zero-filled file, then write data at offset
-            file.set_len(obj_size as u64).map_err(|_| SdError::Eio)?;
-            if !data.is_empty() {
-                file.seek(SeekFrom::Start(offset as u64))
-                    .map_err(|_| SdError::Eio)?;
-                file.write_all(&data).map_err(|_| SdError::Eio)?;
-            }
+            return Err(SdError::InvalidParms);
         }
+        buf
+    };
 
-        file.sync_all().map_err(|_| SdError::Eio)?;
-        Ok::<_, SdError>(())
-    })
-    .await
-    .map_err(|_| SdError::SystemError)??;
+    // Use store interface for create_and_write
+    let store = {
+        let s = sys.read().await;
+        s.store.clone()
+    };
+
+    store.create_and_write(oid, ec_index, &prepared_data).await?;
 
     Ok(ResponseResult::Success)
 }
@@ -155,34 +143,12 @@ async fn read(
         oid, ec_index, offset, length
     );
 
-    let obj_path = {
+    let store = {
         let s = sys.read().await;
-        get_obj_path(&s, oid, ec_index)
+        s.store.clone()
     };
 
-    if !obj_path.exists() {
-        return Err(SdError::NoObj);
-    }
-
-    let path = obj_path.clone();
-    let data = tokio::task::spawn_blocking(move || {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = std::fs::File::open(&path).map_err(|_| SdError::NoObj)?;
-        if length == 0 {
-            // Read entire file
-            let mut buf = Vec::new();
-            file.read_to_end(&mut buf).map_err(|_| SdError::Eio)?;
-            Ok::<_, SdError>(buf)
-        } else {
-            file.seek(SeekFrom::Start(offset as u64))
-                .map_err(|_| SdError::Eio)?;
-            let mut buf = vec![0u8; length as usize];
-            file.read_exact(&mut buf).map_err(|_| SdError::Eio)?;
-            Ok::<_, SdError>(buf)
-        }
-    })
-    .await
-    .map_err(|_| SdError::SystemError)??;
+    let data = store.read(oid, ec_index, offset as u64, length as usize).await?;
 
     Ok(ResponseResult::Data(data))
 }
@@ -203,30 +169,12 @@ async fn write(
         data.len()
     );
 
-    let obj_path = {
+    let store = {
         let s = sys.read().await;
-        get_obj_path(&s, oid, ec_index)
+        s.store.clone()
     };
 
-    if !obj_path.exists() {
-        return Err(SdError::NoObj);
-    }
-
-    let path = obj_path.clone();
-    tokio::task::spawn_blocking(move || {
-        use std::io::{Seek, SeekFrom, Write};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .map_err(|_| SdError::Eio)?;
-        file.seek(SeekFrom::Start(offset as u64))
-            .map_err(|_| SdError::Eio)?;
-        file.write_all(&data).map_err(|_| SdError::Eio)?;
-        file.sync_all().map_err(|_| SdError::Eio)?;
-        Ok::<_, SdError>(())
-    })
-    .await
-    .map_err(|_| SdError::SystemError)??;
+    store.write(oid, ec_index, offset as u64, &data).await?;
 
     Ok(ResponseResult::Success)
 }
@@ -235,16 +183,12 @@ async fn write(
 async fn remove(sys: SharedSys, oid: ObjectId, ec_index: u8) -> SdResult<ResponseResult> {
     debug!("remove: oid={:?}, ec_index={}", oid, ec_index);
 
-    let obj_path = {
+    let store = {
         let s = sys.read().await;
-        get_obj_path(&s, oid, ec_index)
+        s.store.clone()
     };
 
-    if obj_path.exists() {
-        tokio::fs::remove_file(&obj_path)
-            .await
-            .map_err(|_| SdError::Eio)?;
-    }
+    store.remove(oid, ec_index).await?;
 
     Ok(ResponseResult::Success)
 }
@@ -252,16 +196,11 @@ async fn remove(sys: SharedSys, oid: ObjectId, ec_index: u8) -> SdResult<Respons
 /// Flush all pending writes to disk.
 async fn flush(sys: SharedSys) -> SdResult<ResponseResult> {
     debug!("flush peer");
-    let obj_dir = sys.read().await.obj_path();
-    // Sync the object directory to ensure all pending writes are flushed.
-    tokio::task::spawn_blocking(move || {
-        // Open the directory and call sync_all on it (fsync on dir fd)
-        if let Ok(dir) = std::fs::File::open(&obj_dir) {
-            let _ = dir.sync_all();
-        }
-    })
-    .await
-    .map_err(|_| SdError::SystemError)?;
+    let store = {
+        let s = sys.read().await;
+        s.store.clone()
+    };
+    store.flush().await?;
     Ok(ResponseResult::Success)
 }
 
@@ -269,31 +208,15 @@ async fn flush(sys: SharedSys) -> SdResult<ResponseResult> {
 async fn get_obj_list(sys: SharedSys, tgt_epoch: u32) -> SdResult<ResponseResult> {
     debug!("get obj list for epoch {}", tgt_epoch);
 
-    let obj_dir = {
+    let store = {
         let s = sys.read().await;
-        s.obj_path()
+        s.store.clone()
     };
 
-    if !obj_dir.exists() {
-        return Ok(ResponseResult::Data(Vec::new()));
-    }
+    let object_ids = store.get_obj_list().await?;
 
-    // Scan the object directory for all stored objects
-    let oids = tokio::task::spawn_blocking(move || {
-        let mut oids: Vec<u64> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&obj_dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if let Ok(oid) = u64::from_str_radix(name, 16) {
-                        oids.push(oid);
-                    }
-                }
-            }
-        }
-        oids
-    })
-    .await
-    .unwrap_or_default();
+    // Convert Vec<ObjectId> to Vec<u64> for serialization
+    let oids: Vec<u64> = object_ids.iter().map(|oid| oid.raw()).collect();
 
     let data = bincode::serialize(&oids).unwrap_or_default();
     Ok(ResponseResult::Data(data))
@@ -313,12 +236,12 @@ async fn get_epoch(sys: SharedSys, tgt_epoch: u32) -> SdResult<ResponseResult> {
 
 /// Check if an object exists locally.
 async fn exist(sys: SharedSys, oid: ObjectId, ec_index: u8) -> SdResult<ResponseResult> {
-    let obj_path = {
+    let store = {
         let s = sys.read().await;
-        get_obj_path(&s, oid, ec_index)
+        s.store.clone()
     };
 
-    if obj_path.exists() {
+    if store.exist(oid, ec_index).await {
         Ok(ResponseResult::Success)
     } else {
         Err(SdError::NoObj)
@@ -327,18 +250,18 @@ async fn exist(sys: SharedSys, oid: ObjectId, ec_index: u8) -> SdResult<Response
 
 /// Batch check if multiple objects exist locally.
 async fn oids_exist(sys: SharedSys, oids: Vec<ObjectId>) -> SdResult<ResponseResult> {
-    let obj_base = {
+    let store = {
         let s = sys.read().await;
-        s.obj_path()
+        s.store.clone()
     };
 
-    let existing: Vec<ObjectId> = oids
-        .into_iter()
-        .filter(|oid| {
-            let path = obj_base.join(format!("{:016x}", oid.raw()));
-            path.exists()
-        })
-        .collect();
+    // OidsExist has no ec_index field, use ec_index=0
+    let mut existing: Vec<ObjectId> = Vec::new();
+    for oid in oids {
+        if store.exist(oid, 0).await {
+            existing.push(oid);
+        }
+    }
 
     let data = bincode::serialize(&existing).unwrap_or_default();
     Ok(ResponseResult::Data(data))
@@ -346,28 +269,20 @@ async fn oids_exist(sys: SharedSys, oids: Vec<ObjectId>) -> SdResult<ResponseRes
 
 /// Get the SHA1 hash of an object for consistency checking.
 async fn get_hash(sys: SharedSys, oid: ObjectId, _tgt_epoch: u32) -> SdResult<ResponseResult> {
-    let obj_path = {
+    let store = {
         let s = sys.read().await;
-        get_obj_path(&s, oid, 0)
+        s.store.clone()
     };
 
-    if !obj_path.exists() {
-        return Err(SdError::NoObj);
-    }
+    // Read object data through store interface
+    let data = store.read(oid, 0, 0, usize::MAX).await?;
 
-    let path = obj_path.clone();
-    let digest = tokio::task::spawn_blocking(move || {
-        use sha1::{Digest, Sha1};
-        let data = std::fs::read(&path).map_err(|_| SdError::Eio)?;
-        let hash = Sha1::digest(&data);
-        let mut result = [0u8; 20];
-        result.copy_from_slice(&hash);
-        Ok::<_, SdError>(result)
-    })
-    .await
-    .map_err(|_| SdError::SystemError)??;
+    use sha1::{Digest, Sha1};
+    let hash = Sha1::digest(&data);
+    let mut result = [0u8; 20];
+    result.copy_from_slice(&hash);
 
-    Ok(ResponseResult::Hash { digest })
+    Ok(ResponseResult::Hash { digest: result })
 }
 
 /// Repair a replica by fetching the object from another node that has it
@@ -389,6 +304,12 @@ async fn repair_replica(sys: SharedSys, oid: ObjectId) -> SdResult<ResponseResul
         let vnode_info = VNodeInfo::new(&s.cinfo.nodes);
         let target_nodes = vnode_info.oid_to_nodes(oid, nr_copies as usize);
         (target_nodes, s.this_node.nid.to_string(), s.epoch(), s.peer_transport.clone())
+    };
+
+    // Get the store for writing the repaired data
+    let store = {
+        let s = sys.read().await;
+        s.store.clone()
     };
 
     // Try to read the object from each peer (skip self)
@@ -421,27 +342,10 @@ async fn repair_replica(sys: SharedSys, oid: ObjectId) -> SdResult<ResponseResul
 
         match result {
             Ok(data) if !data.is_empty() => {
-                // Write the fetched data locally
-                let obj_path = {
-                    let s = sys.read().await;
-                    get_obj_path(&s, oid, 0)
-                };
-                if let Some(parent) = obj_path.parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-                let path = obj_path.clone();
-                let data_len = data.len();
-                tokio::task::spawn_blocking(move || {
-                    use std::io::Write;
-                    let mut f = std::fs::File::create(&path).map_err(|_| SdError::Eio)?;
-                    f.write_all(&data).map_err(|_| SdError::Eio)?;
-                    f.sync_all().map_err(|_| SdError::Eio)?;
-                    Ok::<_, SdError>(())
-                })
-                .await
-                .map_err(|_| SdError::SystemError)??;
+                // Write the fetched data locally using store interface
+                store.create_and_write(oid, 0, &data).await?;
 
-                info!("repair_replica: repaired {:?} from {} ({} bytes)", oid, addr, data_len);
+                info!("repair_replica: repaired {:?} from {} ({} bytes)", oid, addr, data.len());
                 return Ok(ResponseResult::Success);
             }
             Ok(_) => continue,

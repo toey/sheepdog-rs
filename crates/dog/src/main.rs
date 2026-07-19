@@ -14,6 +14,7 @@
 //!   node      Cluster node management
 //!   cluster   Cluster-wide operations
 //!   upgrade   Cluster upgrade utilities
+//!   disk      Disk (multi-disk store) management
 //!
 //! Options:
 //!   -a, --address <ADDRESS>  Sheep daemon address [default: 127.0.0.1]
@@ -24,6 +25,8 @@
 
 mod cluster;
 mod common;
+mod disk;
+mod iscsi;
 mod node;
 mod treeview;
 mod upgrade;
@@ -65,6 +68,10 @@ enum Commands {
     Cluster(cluster::ClusterArgs),
     /// Cluster upgrade utilities
     Upgrade(upgrade::UpgradeArgs),
+    /// Disk (multi-disk store) management
+    Disk(disk::DiskArgs),
+    /// iSCSI target management
+    Iscsi(iscsi::IscsiArgs),
 }
 
 #[tokio::main]
@@ -98,6 +105,12 @@ async fn main() {
         }
         Commands::Upgrade(args) => {
             upgrade::run(addr, port, args).await;
+        }
+        Commands::Disk(args) => {
+            disk::run(addr, port, args).await;
+        }
+        Commands::Iscsi(cmd) => {
+            iscsi::run(addr, port, cmd).await;
         }
     }
 }

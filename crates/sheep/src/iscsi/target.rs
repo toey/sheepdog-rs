@@ -3,40 +3,16 @@
 //! Provides managed iSCSI target handles backed by `SheepdogScsiBlockDevice`,
 //! with lifecycle control (spawn, shutdown, join) via background OS threads.
 
+#[cfg(feature = "iscsi")]
 use std::sync::Arc;
 
+#[cfg(feature = "iscsi")]
 use iscsi_target::IscsiTarget as SdIscsiTarget;
+#[cfg(feature = "iscsi")]
 use tracing::{error, info, warn};
 
+#[cfg(feature = "iscsi")]
 use crate::iscsi::block_device::SheepdogScsiBlockDevice;
-
-/// iSCSI target configuration.
-///
-/// **Deprecated:** Use [`IscsiConfig`]/[`LunConfig`] (config.rs) for TOML parsing,
-/// or [`IscsiTargetHandle`] for runtime. This struct has no consumer.
-#[deprecated(note = "Use IscsiConfig/LunConfig (config.rs) for TOML parsing, or IscsiTargetHandle for runtime. This struct has no consumer.")]
-pub struct IscsiTargetConfig {
-    /// Target name (IQN format: iqn.yyyy-mm.<reversed domain>:label)
-    pub target_name: String,
-    /// Target alias (optional human-readable name)
-    pub target_alias: Option<String>,
-    /// SCSI LUN number (typically 0 for single-LUN targets)
-    pub lun: u16,
-    /// VDI ID backed by this LUN
-    pub vid: u32,
-    /// VDI size in bytes
-    pub size: u64,
-    /// Block size (default: 512)
-    pub block_size: u32,
-    /// CHAP authentication configuration
-    pub auth: iscsi_target::AuthConfig,
-    /// Maximum concurrent connections for this target (default: 16)
-    pub max_connections: u32,
-    /// Maximum concurrent sessions for this target (default: 256)
-    pub max_sessions: u32,
-    /// Allowed initiator IQNs (None = allow all)
-    pub allowed_initiators: Option<Vec<String>>,
-}
 
 /// Per-LUN managed target with lifecycle control.
 ///
@@ -47,7 +23,12 @@ pub struct IscsiTargetConfig {
 ///   - `target: Arc<SdIscsiTarget<SheepdogScsiBlockDevice>>` — shared reference for .stop()
 ///   - `thread: Option<std::thread::JoinHandle<()>>` — for join-on-shutdown
 ///   - `target_name: String` — metadata for logging
+///   - `target_alias: Option<String>` — metadata for logging
 ///   - `vid: u32` — metadata for logging
+///   - `size: u64` — VDI size in bytes
+///   - `block_size: u32` — block size
+///   - `chap_enabled: bool` — whether CHAP authentication is enabled
+#[cfg(feature = "iscsi")]
 pub struct IscsiTargetHandle {
     /// Shared reference to the underlying iSCSI target. Both the handle and the
     /// background thread hold clones of this Arc. The handle uses it to call .stop().
@@ -56,14 +37,48 @@ pub struct IscsiTargetHandle {
     thread: Option<std::thread::JoinHandle<()>>,
     /// The target IQN name (for logging).
     target_name: String,
+    /// The target alias (for logging/listing).
+    target_alias: Option<String>,
     /// The VID this serves.
     vid: u32,
+    /// The VDI size in bytes.
+    size: u64,
+    /// The block size.
+    block_size: u32,
+    /// Whether CHAP authentication is enabled.
+    chap_enabled: bool,
 }
 
+#[cfg(feature = "iscsi")]
 impl IscsiTargetHandle {
     /// Get the VDI ID this target serves.
     pub fn vid(&self) -> u32 {
         self.vid
+    }
+
+    /// Get the target name.
+    pub fn target_name(&self) -> &str {
+        &self.target_name
+    }
+
+    /// Get the target alias.
+    pub fn target_alias(&self) -> &Option<String> {
+        &self.target_alias
+    }
+
+    /// Get the VDI size in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Get the block size.
+    pub fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    /// Check if CHAP authentication is enabled.
+    pub fn chap_enabled(&self) -> bool {
+        self.chap_enabled
     }
 
     /// Signal the underlying target to shut down gracefully.
@@ -90,11 +105,13 @@ impl IscsiTargetHandle {
 /// Manages the lifecycle of one or more iSCSI targets.
 /// This is the top-level struct returned by `start_iscsi_server()`
 /// and passed to main.rs for shutdown coordination.
+#[cfg(feature = "iscsi")]
 pub struct IscsiServer {
     /// Per-LUN entries with their managed targets and thread handles.
     pub targets: Vec<IscsiTargetHandle>,
 }
 
+#[cfg(feature = "iscsi")]
 impl IscsiServer {
     /// Initiate graceful shutdown of all targets and join threads.
     ///
@@ -111,6 +128,7 @@ impl IscsiServer {
     }
 }
 
+#[cfg(feature = "iscsi")]
 impl Drop for IscsiServer {
     fn drop(&mut self) {
         if !self.targets.is_empty() {
@@ -124,6 +142,7 @@ impl Drop for IscsiServer {
 ///
 /// Provides a fluent API to configure bind address, target name, authentication,
 /// and connection/session limits before spawning the target on a background thread.
+#[cfg(feature = "iscsi")]
 pub struct IscsiTargetBuilder {
     bind_addr: String,
     target_name: String,
@@ -132,6 +151,7 @@ pub struct IscsiTargetBuilder {
     max_sessions: u32,
 }
 
+#[cfg(feature = "iscsi")]
 impl IscsiTargetBuilder {
     /// Create a new builder with the given bind address and target name.
     pub fn new(bind_addr: String, target_name: String) -> Self {
@@ -175,7 +195,12 @@ impl IscsiTargetBuilder {
         device: SheepdogScsiBlockDevice,
     ) -> Result<IscsiTargetHandle, iscsi_target::error::IscsiError> {
         let vid = device.vid();
+        let size = device.size();
+        let block_size = device.block_size();
         let target_name = self.target_name.clone();
+
+        // Check if CHAP is enabled based on auth_config
+        let chap_enabled = matches!(self.auth_config, iscsi_target::AuthConfig::Chap { .. });
 
         // Build the underlying iscsi-crate target.
         // iscsi-crate's `build()` takes `self` (consuming the builder) and
@@ -216,7 +241,125 @@ impl IscsiTargetBuilder {
             target: shared_target,
             thread: Some(thread),
             target_name,
+            target_alias: None, // Default to no alias
             vid,
+            size,
+            block_size,
+            chap_enabled,
         })
+    }
+}
+
+#[cfg(feature = "iscsi")]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{IscsiAuthConfig, LunConfig};
+
+    /// Test 1: IscsiTargetBuilder::new() creates builder with correct defaults.
+    #[test]
+    fn test_builder_defaults() {
+        let builder = IscsiTargetBuilder::new(
+            "127.0.0.1:3260".to_string(),
+            "iqn.2025-01.io.github:sheepdog.test".to_string(),
+        );
+        // Verify builder was created successfully with correct defaults
+        assert_eq!(builder.max_connections, 16);
+        assert_eq!(builder.max_sessions, 256);
+        assert!(matches!(builder.auth_config, iscsi_target::AuthConfig::None));
+    }
+
+    /// Test 2: with_auth() sets auth config correctly (builder pattern returns self).
+    #[test]
+    fn test_builder_with_auth() {
+        let auth = iscsi_target::AuthConfig::Chap {
+            credentials: iscsi_target::ChapCredentials::new("user", "secret"),
+        };
+        let builder = IscsiTargetBuilder::new("127.0.0.1:3260".to_string(), "iqn.test".to_string())
+            .with_auth(auth);
+        // Verify builder pattern returns self with CHAP auth configured
+        assert!(matches!(builder.auth_config, iscsi_target::AuthConfig::Chap { .. }));
+    }
+
+    /// Test 3: with_max_connections() sets max connections.
+    #[test]
+    fn test_builder_with_max_connections() {
+        let builder = IscsiTargetBuilder::new("127.0.0.1:3260".to_string(), "iqn.test".to_string())
+            .with_max_connections(32);
+        assert_eq!(builder.max_connections, 32);
+    }
+
+    /// Test 4: with_max_sessions() sets max sessions.
+    #[test]
+    fn test_builder_with_max_sessions() {
+        let builder = IscsiTargetBuilder::new("127.0.0.1:3260".to_string(), "iqn.test".to_string())
+            .with_max_sessions(128);
+        assert_eq!(builder.max_sessions, 128);
+    }
+
+    /// Test 5: IscsiAuthConfig::to_auth_config() — None auth returns AuthConfig::None.
+    #[test]
+    fn test_auth_config_none() {
+        let auth_config = IscsiAuthConfig::default();
+        let result = auth_config.to_auth_config();
+        assert!(matches!(result, iscsi_target::AuthConfig::None));
+    }
+
+    /// Test 6: IscsiAuthConfig::to_auth_config() — Chap auth returns correct AuthConfig.
+    #[test]
+    fn test_auth_config_chap() {
+        let auth_config = IscsiAuthConfig {
+            auth_type: Some("chap".to_string()),
+            username: Some("myuser".to_string()),
+            secret: Some("mysecret".to_string()),
+            ..Default::default()
+        };
+        let result = auth_config.to_auth_config();
+        assert!(matches!(
+            result,
+            iscsi_target::AuthConfig::Chap { .. }
+        ));
+    }
+
+    /// Test 7: IscsiAuthConfig::to_auth_config() — MutualChap auth returns correct AuthConfig.
+    #[test]
+    fn test_auth_config_mutual_chap() {
+        let auth_config = IscsiAuthConfig {
+            auth_type: Some("mutual_chap".to_string()),
+            username: Some("initiator".to_string()),
+            secret: Some("target_secret".to_string()),
+            target_username: Some("target".to_string()),
+            initiator_secret: Some("initiator_secret".to_string()),
+        };
+        let result = auth_config.to_auth_config();
+        assert!(matches!(
+            result,
+            iscsi_target::AuthConfig::MutualChap { .. }
+        ));
+    }
+
+    /// Test 8: IscsiAuthConfig::to_auth_config() — Chap with empty secret uses defaults.
+    #[test]
+    fn test_auth_config_chap_empty_secret() {
+        let auth_config = IscsiAuthConfig {
+            auth_type: Some("chap".to_string()),
+            username: None, // Will use "default"
+            secret: None,   // Will use empty string
+            ..Default::default()
+        };
+        let result = auth_config.to_auth_config();
+        assert!(matches!(
+            result,
+            iscsi_target::AuthConfig::Chap { .. }
+        ));
+    }
+
+    /// Test 9: LunConfig::with_chap() builds a CHAP-authenticated config.
+    #[test]
+    fn test_lun_config_with_chap() {
+        let lun = LunConfig::default().with_chap("testuser", "testsecret");
+        assert_eq!(lun.auth.auth_type, Some("chap".to_string()));
+        assert_eq!(lun.auth.username, Some("testuser".to_string()));
+        assert_eq!(lun.auth.secret, Some("testsecret".to_string()));
     }
 }

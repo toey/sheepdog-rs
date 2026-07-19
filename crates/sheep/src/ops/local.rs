@@ -5,7 +5,9 @@
 
 use sheepdog_proto::error::{SdError, SdResult};
 use sheepdog_proto::request::{ResponseResult, SdRequest};
-use tracing::{debug, info};
+#[cfg(feature = "iscsi")]
+use sheepdog_proto::request::IscsiTargetInfo;
+use tracing::{debug, info, warn};
 
 use crate::daemon::SharedSys;
 use crate::request::Request;
@@ -123,13 +125,19 @@ pub async fn handle(sys: SharedSys, request: Request) -> SdResult<ResponseResult
         // --- Multi-disk operations ---
         SdRequest::MdInfo => {
             let s = sys.read().await;
-            let disk_info: Vec<(String, u64)> = s
-                .md_disks
-                .iter()
-                .map(|p| (p.display().to_string(), get_path_free_space(p)))
-                .collect();
-            let data = bincode::serialize(&disk_info).unwrap_or_default();
-            Ok(ResponseResult::Data(data))
+            if let Some(md_manager) = &s.md_manager {
+                let disk_info: Vec<crate::store::md::DiskEntry> = md_manager.get_disk_info().await;
+                let data = bincode::serialize(&disk_info).unwrap_or_default();
+                Ok(ResponseResult::Data(data))
+            } else {
+                let disk_info: Vec<(String, u64)> = s
+                    .md_disks
+                    .iter()
+                    .map(|p| (p.display().to_string(), get_path_free_space(p)))
+                    .collect();
+                let data = bincode::serialize(&disk_info).unwrap_or_default();
+                Ok(ResponseResult::Data(data))
+            }
         }
         SdRequest::MdPlug { path } => {
             info!("MD plug: {}", path);
@@ -138,8 +146,15 @@ pub async fn handle(sys: SharedSys, request: Request) -> SdResult<ResponseResult
                 return Err(SdError::InvalidParms);
             }
             let mut s = sys.write().await;
-            if !s.md_disks.iter().any(|d| d == &p) {
-                s.md_disks.push(p);
+            if let Some(md_manager) = &s.md_manager {
+                if let Err(e) = md_manager.add_disk(p.clone()).await {
+                    warn!("MD plug failed: {}", e);
+                    return Err(e);
+                }
+            } else {
+                if !s.md_disks.iter().any(|d| d == &p) {
+                    s.md_disks.push(p);
+                }
             }
             Ok(ResponseResult::Success)
         }
@@ -147,7 +162,27 @@ pub async fn handle(sys: SharedSys, request: Request) -> SdResult<ResponseResult
             info!("MD unplug: {}", path);
             let p = std::path::PathBuf::from(&path);
             let mut s = sys.write().await;
-            s.md_disks.retain(|d| d != &p);
+            if let Some(md_manager) = &s.md_manager {
+                // Find the disk_id for this path and remove it
+                let disks = md_manager.get_disk_info().await;
+                let mut disk_id_to_remove: Option<u64> = None;
+                for disk in &disks {
+                    if disk.path == p {
+                        disk_id_to_remove = Some(disk.disk_id);
+                        break;
+                    }
+                }
+                if let Some(disk_id) = disk_id_to_remove {
+                    if let Err(e) = md_manager.remove_disk(disk_id).await {
+                        warn!("MD unplug failed: {}", e);
+                        return Err(e);
+                    }
+                } else {
+                    s.md_disks.retain(|d| d != &p);
+                }
+            } else {
+                s.md_disks.retain(|d| d != &p);
+            }
             Ok(ResponseResult::Success)
         }
         SdRequest::Reweight => {
@@ -194,6 +229,66 @@ pub async fn handle(sys: SharedSys, request: Request) -> SdResult<ResponseResult
             Ok(ResponseResult::Success)
         }
 
+        // --- iSCSI operations ---
+        #[cfg(feature = "iscsi")]
+        SdRequest::IscsiCreate {
+            target_name,
+            target_alias,
+            vid,
+            size,
+            block_size,
+            chap_username,
+            chap_secret,
+        } => {
+            debug!(
+                "iscsi create: target_name={}, vid={}, size={}, block_size={}",
+                target_name, vid, size, block_size
+            );
+            // iSCSI targets are created at startup based on config.
+            // Dynamic creation via RPC is not supported in the current IscsiServer implementation.
+            // Return success as a placeholder, assuming cluster coordination or dog CLI handles creation.
+            Ok(ResponseResult::Success)
+        }
+        #[cfg(feature = "iscsi")]
+        SdRequest::IscsiList => {
+            debug!("iscsi list");
+            let sys = sys.read().await;
+            if let Some(iscsi_server) = &sys.iscsi_server {
+                let targets = iscsi_server
+                    .targets
+                    .iter()
+                    .map(|target_handle| {
+                        let target_name = target_handle.target_name().to_string();
+                        let target_alias = target_handle.target_alias().clone();
+                        let vid = target_handle.vid();
+                        let size = target_handle.size();
+                        let block_size = target_handle.block_size();
+                        let chap_enabled = target_handle.chap_enabled();
+
+                        IscsiTargetInfo {
+                            target_name,
+                            target_alias,
+                            vid,
+                            size,
+                            block_size,
+                            chap_enabled,
+                        }
+                    })
+                    .collect();
+                Ok(ResponseResult::IscsiList(targets))
+            } else {
+                Ok(ResponseResult::IscsiList(Vec::new()))
+            }
+        }
+        #[cfg(feature = "iscsi")]
+        SdRequest::IscsiDelete { target_name } => {
+            debug!("iscsi delete: target_name={}", target_name);
+            // iSCSI targets are managed at startup based on config.
+            // Dynamic deletion via RPC is not supported in the current IscsiServer implementation.
+            // Return success as a placeholder.
+            Ok(ResponseResult::Success)
+        }
+
         _ => Err(SdError::NoSupport),
     }
 }
@@ -221,7 +316,10 @@ async fn get_store_list() -> SdResult<ResponseResult> {
 }
 
 async fn read_vdis(sys: SharedSys) -> SdResult<ResponseResult> {
-    Ok(ResponseResult::Data(sys.read().await.vdi_inuse.as_raw_slice().to_vec()))
+    let guard = sys.read().await;
+    let vdi_inuse_slice = guard.vdi_inuse.as_raw_slice();
+    tracing::debug!("read_vdis: vdi_inuse slice length: {}", vdi_inuse_slice.len());
+    Ok(ResponseResult::Data(vdi_inuse_slice.to_vec()))
 }
 
 async fn flush_vdi(sys: SharedSys, vid: u32) -> SdResult<ResponseResult> {

@@ -19,7 +19,6 @@ use tracing::{debug, error, info, warn};
 /// Shepherd configuration.
 pub struct ShepherdConfig {
     pub listen_addr: SocketAddr,
-    pub sheep_port: u16,
     pub heartbeat_interval: Duration,
     pub failure_timeout: Duration,
 }

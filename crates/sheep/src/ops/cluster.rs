@@ -7,7 +7,7 @@
 use sheepdog_proto::error::{SdError, SdResult};
 use sheepdog_proto::node::ClusterStatus;
 use sheepdog_proto::request::{ResponseResult, SdRequest};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::daemon::SharedSys;
 use crate::request::Request;
@@ -74,9 +74,10 @@ pub async fn handle(sys: SharedSys, request: Request) -> SdResult<ResponseResult
             copy_policy,
             flags,
             store,
+            force,
         } => {
-            info!("formatting cluster: copies={}, store={}", copies, store);
-            make_fs(sys, copies, copy_policy, flags, &store).await
+            info!("formatting cluster: copies={}, store={}, force={}", copies, store, force);
+            make_fs(sys, copies, copy_policy, flags, &store, force).await
         }
 
         SdRequest::Shutdown => {
@@ -297,17 +298,18 @@ async fn snapshot_vdi(sys: SharedSys, name: &str, _tag: &str) -> SdResult<Respon
 }
 
 // --- Cluster Management ---
-
 async fn make_fs(
     sys: SharedSys,
     copies: u8,
     copy_policy: u8,
     flags: u16,
     store: &str,
+    force: bool,
 ) -> SdResult<ResponseResult> {
     let mut s = sys.write().await;
 
-    if s.cinfo.status != ClusterStatus::WaitForFormat {
+    // Only allow format if cluster is in WaitForFormat status, or if force is true and cluster is in Ok status
+    if s.cinfo.status != ClusterStatus::WaitForFormat && !(force && s.cinfo.status == ClusterStatus::Ok) {
         return Err(SdError::InvalidParms);
     }
 
@@ -330,6 +332,55 @@ async fn make_fs(
         store,
         s.epoch()
     );
+
+    // Save config after format
+    let dir = s.dir.clone();
+    let cinfo = s.cinfo.clone();
+    drop(s);
+
+    if let Err(e) = crate::config::save_config(&dir, &cinfo).await {
+        error!("failed to save config after format: {}", e);
+    }
+
+    // Broadcast format notification to all cluster members
+    let cluster_driver = {
+        let s = sys.read().await;
+        s.cluster_driver.clone()
+    };
+
+    // Serialize the format notification using the same structure as handle_cluster_notify
+    #[derive(serde::Serialize)]
+    enum ClusterNotify {
+        Format {
+            nr_copies: u8,
+            copy_policy: u8,
+            flags: u16,
+            store: String,
+            ctime: u64,
+        },
+        Shutdown,
+        AlterCopy {
+            nr_copies: u8,
+            copy_policy: u8,
+        },
+        DisableRecovery,
+        EnableRecovery,
+    }
+
+    let notify_data = bincode::serialize(&ClusterNotify::Format {
+        nr_copies: copies,
+        copy_policy,
+        flags,
+        store: store.to_string(),
+        ctime: cinfo.ctime,
+    }).map_err(|e| {
+        error!("failed to serialize format notification: {}", e);
+        SdError::SystemError
+    })?;
+
+    if let Err(e) = cluster_driver.notify(&notify_data).await {
+        error!("failed to broadcast format notification: {}", e);
+    }
 
     Ok(ResponseResult::Success)
 }

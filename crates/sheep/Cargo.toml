@@ -28,13 +28,17 @@ memmap2 = "0.9"
 bitvec = "1"
 lru = "0.7"
 rand = "0.8"
-iscsi-target = "1.0.0"
 toml = { workspace = true }
+
+[dependencies.iscsi-target]
+version = "1.0.0"
+optional = true
 
 [features]
 default = ["http"]
 http = ["dep:axum", "dep:hyper"]
 nfs = []
+iscsi = ["dep:iscsi-target"]
 dpdk = ["dep:sheepdog-dpdk"]
 
 [dependencies.axum]

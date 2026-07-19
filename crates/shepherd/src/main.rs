@@ -14,7 +14,6 @@ mod handler;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use clap::Parser;
-use sheepdog_proto::constants::SD_LISTEN_PORT;
 use sheepdog_proto::defaults::{
     DEFAULT_SHEPHERD_FAILURE_TIMEOUT_SECS, DEFAULT_SHEPHERD_HEARTBEAT_INTERVAL_SECS,
     DEFAULT_SHEPHERD_PORT,
@@ -32,10 +31,6 @@ struct Args {
     /// Listen port
     #[arg(short = 'p', long, default_value_t = DEFAULT_SHEPHERD_PORT)]
     port: u16,
-
-    /// Sheep daemon port to monitor
-    #[arg(long, default_value_t = SD_LISTEN_PORT)]
-    sheep_port: u16,
 
     /// Heartbeat interval in seconds
     #[arg(long, default_value_t = DEFAULT_SHEPHERD_HEARTBEAT_INTERVAL_SECS)]
@@ -73,7 +68,6 @@ async fn main() {
 
     let config = handler::ShepherdConfig {
         listen_addr,
-        sheep_port: args.sheep_port,
         heartbeat_interval: std::time::Duration::from_secs(args.heartbeat_interval),
         failure_timeout: std::time::Duration::from_secs(args.failure_timeout),
     };

@@ -3,11 +3,13 @@
 //! Defines the listen address and related network settings for the iSCSI target.
 
 /// iSCSI portal configuration.
+#[cfg(feature = "iscsi")]
 pub struct IscsiPortalConfig {
     /// Listen address (default: "0.0.0.0:3260")
     pub listen_address: String,
 }
 
+#[cfg(feature = "iscsi")]
 impl Default for IscsiPortalConfig {
     fn default() -> Self {
         Self {

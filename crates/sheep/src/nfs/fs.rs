@@ -89,6 +89,12 @@ impl NfsFilesystem {
         self.attrs.get(&ino).ok_or(SdError::NoObj)
     }
 
+    /// Set file attributes by inode number.
+    pub fn set_attr(&mut self, ino: u64, attr: FileAttr) -> SdResult<()> {
+        self.attrs.insert(ino, attr);
+        Ok(())
+    }
+
     /// Lookup a name in a directory.
     pub fn lookup(&self, parent_ino: u64, name: &str) -> SdResult<u64> {
         if let Some(entries) = self.dir_entries.get(&parent_ino) {

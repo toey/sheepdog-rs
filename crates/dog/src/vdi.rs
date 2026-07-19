@@ -426,11 +426,12 @@ async fn vdi_list(addr: &str, port: u16, name: Option<&str>, raw: bool) {
     let vdi_bitmap = match resp {
         ResponseResult::Data(data) => data,
         _ => {
-            println!("No VDIs found.");
+            println!("No VDIs found. (Unexpected response type)");
             return;
         }
     };
 
+    tracing::debug!("vdi_list: vdi_bitmap length: {}", vdi_bitmap.len());
     if vdi_bitmap.is_empty() {
         println!("No VDIs found.");
         return;
@@ -445,8 +446,12 @@ async fn vdi_list(addr: &str, port: u16, name: Option<&str>, raw: bool) {
         if byte == 0 {
             continue;
         }
+        // The bitmap uses Msb0 bit ordering from bitvec
+        // bit 0 in the bitvec is the most significant bit (bit 7) of the byte
+        // bit 7 in the bitvec is the least significant bit (bit 0) of the byte
         for bit in 0..8u32 {
-            if byte & (1 << bit) != 0 {
+            let bit_mask = 1 << (7 - bit);
+            if byte & bit_mask != 0 {
                 let vid = (byte_idx as u32) * 8 + bit;
 
                 // Try to read the inode for this VDI
@@ -505,10 +510,12 @@ async fn read_vdi_inode(stream: &mut TcpStream, vid: u32) -> Option<SdInode> {
     use sheepdog_proto::oid::ObjectId;
 
     let oid = ObjectId::from_vid(vid);
-    let req = SdRequest::ReadObj {
+    let obj_size = oid.obj_size() as u32;
+    let req = SdRequest::ReadPeer {
         oid,
+        ec_index: 0,
         offset: 0,
-        length: 0, // 0 means read full object
+        length: obj_size,
     };
 
     match send_request(stream, req).await {

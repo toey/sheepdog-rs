@@ -2,8 +2,6 @@
 //!
 //! Saves/loads cluster info and epoch logs to disk so that a restarting
 //! node can rejoin with the correct epoch.
-#![allow(dead_code)]
-
 use std::path::Path;
 
 use serde::Deserialize;
@@ -70,6 +68,7 @@ pub async fn load_epoch_log(dir: &Path, epoch: u32) -> SdResult<EpochLog> {
 }
 
 /// Get the latest epoch number from disk.
+#[allow(dead_code)]
 pub async fn get_latest_epoch(dir: &Path) -> SdResult<u32> {
     let epoch_dir = dir.join("epoch");
     if !epoch_dir.exists() {
@@ -113,6 +112,7 @@ pub fn build_epoch_log(cinfo: &ClusterInfo) -> EpochLog {
 }
 
 /// Remove epoch logs for epochs strictly greater than the given epoch.
+#[allow(dead_code)]
 pub async fn remove_epoch_logs_after(dir: &Path, epoch: u32) -> SdResult<()> {
     let epoch_dir = dir.join("epoch");
     if !epoch_dir.exists() {
@@ -139,6 +139,7 @@ pub async fn remove_epoch_logs_after(dir: &Path, epoch: u32) -> SdResult<()> {
 
 /// Local deserializable auth config for TOML parsing.
 #[derive(Deserialize, Default, Clone, Debug)]
+#[cfg_attr(not(feature = "iscsi"), allow(dead_code))]
 pub struct IscsiAuthConfig {
     #[serde(default)]
     pub auth_type: Option<String>,
@@ -152,6 +153,7 @@ pub struct IscsiAuthConfig {
     pub initiator_secret: Option<String>,
 }
 
+#[cfg(feature = "iscsi")]
 impl IscsiAuthConfig {
     /// Convert to iscsi_target::AuthConfig.
     pub fn to_auth_config(&self) -> iscsi_target::AuthConfig {
@@ -188,6 +190,7 @@ impl IscsiAuthConfig {
 
 /// Full TOML config file format.
 #[derive(Deserialize, Default, Clone, Debug)]
+#[cfg_attr(not(feature = "iscsi"), allow(dead_code))]
 pub struct TomlConfig {
     #[serde(default)]
     pub iscsi: IscsiConfig,
@@ -195,6 +198,7 @@ pub struct TomlConfig {
 
 /// iSCSI daemon configuration.
 #[derive(Deserialize, Default, Clone, Debug)]
+#[cfg_attr(not(feature = "iscsi"), allow(dead_code))]
 pub struct IscsiConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -210,6 +214,7 @@ fn default_listen_address() -> String {
 
 /// Per-LUN configuration (one LUN = one iSCSI target).
 #[derive(Deserialize, Default, Clone, Debug)]
+#[cfg_attr(not(feature = "iscsi"), allow(dead_code))]
 pub struct LunConfig {
     #[serde(default)]
     pub target_name: String,
@@ -245,6 +250,7 @@ fn default_max_sessions() -> u32 {
     256
 }
 
+#[cfg(feature = "iscsi")]
 impl LunConfig {
     /// Helper to create a CHAP-authenticated LUN config.
     pub fn with_chap(mut self, username: impl Into<String>, secret: impl Into<String>) -> Self {

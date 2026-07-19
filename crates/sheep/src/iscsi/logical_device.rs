@@ -1,14 +1,18 @@
 //! Logical device mapping — maps SCSI LBA to Sheepdog OIDs.
 
+#[cfg(feature = "iscsi")]
 use sheepdog_proto::oid::ObjectId;
 
 /// Sheepdog object size: 4MB
+#[cfg(feature = "iscsi")]
 pub const SHEEPDOG_OBJECT_SIZE: u64 = 4 * 1024 * 1024;
 
 /// Default SCSI block size: 512 bytes
+#[cfg(feature = "iscsi")]
 pub const SCSI_BLOCK_SIZE: u64 = 512;
 
 /// Number of blocks per object (with 512-byte blocks)
+#[cfg(feature = "iscsi")]
 pub const BLOCKS_PER_OBJECT: u64 = SHEEPDOG_OBJECT_SIZE / SCSI_BLOCK_SIZE; // 8192
 
 /// Convert a SCSI LBA range to Sheepdog object ranges.
@@ -23,6 +27,7 @@ pub const BLOCKS_PER_OBJECT: u64 = SHEEPDOG_OBJECT_SIZE / SCSI_BLOCK_SIZE; // 81
 ///
 /// # Returns
 /// Vector of (object_index, offset_in_object, bytes_to_transfer)
+#[cfg(feature = "iscsi")]
 pub fn lba_to_object_range(
     start_lba: u64,
     num_blocks: u64,
@@ -59,10 +64,12 @@ pub fn lba_to_object_range(
 /// - Bits 32-55: VDI ID (24 bits)
 /// - Bits 56-59: reserved VDI object space
 /// - Bits 60-63: object type identifier (0 for data objects)
+#[cfg(feature = "iscsi")]
 pub fn vid_to_oid(vid: u32, object_index: u64) -> ObjectId {
     // Data objects have type identifier 0 (bits 60-63 = 0)
-    // VDI space starts at bit 32
-    let raw = (vid as u64) << 32 | object_index;
+    // VDI space starts at bit 32 (24 bits)
+    // Object index is bits 0-31 (32 bits)
+    let raw = ((vid as u64 & 0xFFFFFF) << 32) | (object_index & 0xFFFFFFFF);
     ObjectId::new(raw)
 }
 
