@@ -2,3 +2,8 @@
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+test/e2e/node*
+
+.peru/
+.llm/knowledge/sheepdog/tests/

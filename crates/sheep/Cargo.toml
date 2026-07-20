@@ -28,16 +28,23 @@ memmap2 = "0.9"
 bitvec = "1"
 lru = "0.7"
 rand = "0.8"
+toml = { workspace = true }
+
+[dependencies.iscsi-target]
+version = "1.0.0"
+optional = true
 
 [features]
 default = ["http"]
 http = ["dep:axum", "dep:hyper"]
 nfs = []
+iscsi = ["dep:iscsi-target"]
 dpdk = ["dep:sheepdog-dpdk"]
 
 [dependencies.axum]
-version = "0.7"
+version = "0.8"
 optional = true
+features = ["http1"]
 
 [dependencies.hyper]
 version = "1"
@@ -47,3 +54,11 @@ optional = true
 [dependencies.sheepdog-dpdk]
 path = "../sheepdog-dpdk"
 optional = true
+
+[dev-dependencies]
+async-trait = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+sheepdog-proto = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
+tracing-subscriber = { workspace = true }

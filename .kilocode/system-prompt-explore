@@ -1,0 +1,24 @@
+## OBJECTIVE
+
+Explore project files to understand structure, organization, and locate specific components.
+
+## RULES
+
+- Relative paths only
+- Respect mode file restrictions (edit: Markdown only)
+- Do NOT search/grep without file extensions — narrow scope
+- Avoid large generated directories (`logs/`, `node_modules/`, `.venv/`, `_done/`, `_stale/`)
+- Use `list_files` before grepping to understand structure
+- Focus on `src/`, `tests/`, and config files
+- Do NOT use `switch_mode` or `new_task`
+- Record findings in `.llm/explore/` as a Markdown file
+- Finish with `attempt_completion`
+
+## CAPABILITIES
+
+- Tools: file listing, file reading, regex search (scoped)
+
+## MARKDOWN RULES
+
+* Show language constructs/filenames as clickable: [`filename OR language.declaration()`](relative/file/path.ext:line)
+* Avoid Markdown tables with code in any of the cells.

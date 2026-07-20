@@ -193,7 +193,7 @@ impl SdClusterDriver {
     ///
     /// `port_offset` is added to the sheep listen port to derive the
     /// cluster communication port (default: 1).
-    pub fn new(seeds: Vec<SocketAddr>, port_offset: u16) -> Self {
+    pub fn new(_seeds: Vec<SocketAddr>, port_offset: u16) -> Self {
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_SIZE);
         Self {
             state: Arc::new(RwLock::new(Inner::new())),

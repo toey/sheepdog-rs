@@ -3,7 +3,7 @@
 # cluster.sh — Start / Stop / Status a 3-node sheepdog-rs cluster on localhost
 #
 # Usage:
-#   ./scripts/cluster.sh start   [--nbd] [--nfs] [--format] [--copies N]
+#   ./scripts/cluster.sh start   [--nbd] [--nfs] [--iscsi] [--format] [--copies N] [--all]
 #   ./scripts/cluster.sh stop
 #   ./scripts/cluster.sh status
 #   ./scripts/cluster.sh clean       # stop + remove data
@@ -78,20 +78,31 @@ wait_for_port() {
 do_start() {
     local enable_nbd=false
     local enable_nfs=false
+    local enable_iscsi=false
     local do_format=false
     local copies=1
+    local enable_all=false
 
     # Parse flags
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --all)      enable_all=true ;;
             --nbd)      enable_nbd=true ;;
             --nfs)      enable_nfs=true ;;
+            --iscsi)    enable_iscsi=true ;;
             --format)   do_format=true ;;
             --copies)   shift; copies="$1" ;;
             *)          err "Unknown flag: $1"; exit 1 ;;
         esac
         shift
     done
+
+    # --all enables every feature
+    if $enable_all; then
+        enable_nbd=true
+        enable_nfs=true
+        enable_iscsi=true
+    fi
 
     # Check binary
     if ! command -v "$SHEEP" &>/dev/null && [[ ! -x "$SHEEP" ]]; then
@@ -140,8 +151,11 @@ do_start() {
     if $enable_nfs; then
         extra_args="$extra_args --nfs --nfs-port $NFS_PORT"
     fi
+    if $enable_iscsi; then
+        extra_args="$extra_args --iscsi"
+    fi
 
-    info "Starting node 0  (port=${port0}, http=${http0})"
+    info "Starting node 0  (port=${port0}, http=${http0}, extra=${extra_args:-none})"
     # shellcheck disable=SC2086
     "$SHEEP" --cluster-driver sdcluster \
         -b "$BIND" -p "$port0" \
@@ -175,6 +189,7 @@ do_start() {
             --seed "${BIND}:${port0}" \
             --http-port "$http" \
             -l info \
+            $extra_args \
             "$dir" \
             > "$log" 2>&1 &
         echo $! > "$pid"

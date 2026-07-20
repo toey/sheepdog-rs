@@ -23,7 +23,7 @@ use super::common;
 use super::StoreDriver;
 
 /// Information about a single physical disk.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiskEntry {
     /// Unique identifier for this disk.
     pub disk_id: u64,
@@ -50,6 +50,7 @@ impl DiskEntry {
         })
     }
 
+    #[allow(dead_code)]
     /// Refresh the space information for this disk.
     pub fn refresh_space(&mut self) -> SdResult<()> {
         let space = common::get_disk_space(&self.path)?;
@@ -87,6 +88,11 @@ impl MdManager {
         }
     }
 
+    /// Check if the store driver uses tree layout.
+    fn is_tree(&self) -> bool {
+        self.store_driver_name == "tree"
+    }
+
     /// Add a disk to the manager (hot-plug).
     ///
     /// Initializes the disk's directory structure and registers it.
@@ -95,14 +101,16 @@ impl MdManager {
 
         // Create obj directory if it doesn't exist
         let obj_dir_clone = obj_dir.clone();
-        tokio::task::spawn_blocking(move || {
+        let create_res = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&obj_dir_clone).map_err(|e| {
                 error!("md: failed to create obj dir {}: {}", obj_dir_clone.display(), e);
                 SdError::Eio
             })
         })
         .await
-        .map_err(|_| SdError::SystemError)??;
+        .map_err(|_| SdError::SystemError)?;
+        
+        create_res?;
 
         let mut next_id = self.next_id.write().await;
         let disk_id = *next_id;
@@ -144,6 +152,7 @@ impl MdManager {
         }
     }
 
+    #[allow(dead_code)]
     /// Purge a disk entirely from the manager.
     ///
     /// Only works on inactive disks.
@@ -204,12 +213,11 @@ impl MdManager {
         &self,
         oid: ObjectId,
         ec_index: u8,
-        use_tree: bool,
     ) -> SdResult<DiskEntry> {
         let disks = self.disks.read().await;
 
         for entry in disks.values() {
-            let path = if use_tree {
+            let path = if self.is_tree() {
                 common::tree_obj_path(&entry.path, oid, ec_index)
             } else {
                 common::plain_obj_path(&entry.path, oid, ec_index)
@@ -235,10 +243,9 @@ impl MdManager {
         &self,
         oid: ObjectId,
         ec_index: u8,
-        use_tree: bool,
     ) -> SdResult<PathBuf> {
-        let disk = self.find_obj_disk(oid, ec_index, use_tree).await?;
-        if use_tree {
+        let disk = self.find_obj_disk(oid, ec_index).await?;
+        if self.is_tree() {
             Ok(common::tree_obj_path(&disk.path, oid, ec_index))
         } else {
             Ok(common::plain_obj_path(&disk.path, oid, ec_index))
@@ -246,19 +253,20 @@ impl MdManager {
     }
 
     /// Collect object IDs from all disks.
-    pub async fn get_all_obj_list(&self, use_tree: bool) -> SdResult<Vec<ObjectId>> {
+    pub async fn get_all_obj_list(&self) -> SdResult<Vec<ObjectId>> {
         let disks = self.disks.read().await;
         let mut all_oids = Vec::new();
+        let is_tree = self.is_tree();
 
         for entry in disks.values() {
             let obj_dir = entry.obj_dir();
+            let obj_dir_clone = obj_dir.clone();
             let oids = {
-                let tree = use_tree;
                 tokio::task::spawn_blocking(move || {
-                    if tree {
-                        common::scan_tree_obj_dir(&obj_dir)
+                    if is_tree {
+                        common::scan_tree_obj_dir(&obj_dir_clone)
                     } else {
-                        common::scan_obj_dir(&obj_dir)
+                        common::scan_obj_dir(&obj_dir_clone)
                     }
                 })
                 .await
@@ -271,6 +279,7 @@ impl MdManager {
         Ok(all_oids)
     }
 
+    #[allow(dead_code)]
     /// Refresh disk space information for all disks.
     pub async fn refresh_all(&self) -> SdResult<()> {
         let mut disks = self.disks.write().await;
@@ -290,12 +299,14 @@ impl MdManager {
         disks.values().cloned().collect()
     }
 
+    #[allow(dead_code)]
     /// Get the number of active disks.
     pub async fn nr_active_disks(&self) -> usize {
         let disks = self.disks.read().await;
         disks.values().filter(|d| d.active).count()
     }
 
+    #[allow(dead_code)]
     /// Get the total and free space across all active disks.
     pub async fn total_space(&self) -> (u64, u64) {
         let disks = self.disks.read().await;
@@ -309,9 +320,8 @@ impl MdManager {
         &self,
         oid: ObjectId,
         ec_index: u8,
-        use_tree: bool,
     ) -> bool {
-        self.find_obj_disk(oid, ec_index, use_tree).await.is_ok()
+        self.find_obj_disk(oid, ec_index).await.is_ok()
     }
 
     /// Write an object to the best available disk.
@@ -320,18 +330,18 @@ impl MdManager {
         oid: ObjectId,
         ec_index: u8,
         data: &[u8],
-        use_tree: bool,
     ) -> SdResult<()> {
         let disk = self.select_disk().await?;
-        let path = if use_tree {
+        let path = if self.is_tree() {
             common::tree_obj_path(&disk.path, oid, ec_index)
         } else {
             common::plain_obj_path(&disk.path, oid, ec_index)
         };
 
         let data = data.to_vec();
+        let is_tree = self.is_tree();
         tokio::task::spawn_blocking(move || {
-            if use_tree {
+            if is_tree {
                 // Ensure VDI subdirectory exists for tree layout
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| {
@@ -351,9 +361,8 @@ impl MdManager {
         &self,
         oid: ObjectId,
         ec_index: u8,
-        use_tree: bool,
     ) -> SdResult<()> {
-        let path = self.get_obj_path(oid, ec_index, use_tree).await?;
+        let path = self.get_obj_path(oid, ec_index).await?;
 
         tokio::task::spawn_blocking(move || {
             std::fs::remove_file(&path).map_err(|e| {
@@ -372,9 +381,8 @@ impl MdManager {
         ec_index: u8,
         offset: u64,
         length: usize,
-        use_tree: bool,
     ) -> SdResult<Vec<u8>> {
-        let path = self.get_obj_path(oid, ec_index, use_tree).await?;
+        let path = self.get_obj_path(oid, ec_index).await?;
 
         tokio::task::spawn_blocking(move || common::read_at(&path, offset, length))
             .await
@@ -388,15 +396,15 @@ impl MdManager {
 /// objects across multiple disks.
 pub struct MdStore {
     manager: Arc<MdManager>,
-    use_tree: bool,
 }
 
 impl MdStore {
     /// Create a new MdStore wrapping the given MdManager.
-    pub fn new(manager: Arc<MdManager>, use_tree: bool) -> Self {
-        Self { manager, use_tree }
+    pub fn new(manager: Arc<MdManager>) -> Self {
+        Self { manager }
     }
 
+    #[allow(dead_code)]
     /// Get a reference to the underlying MdManager.
     pub fn manager(&self) -> &Arc<MdManager> {
         &self.manager
@@ -406,7 +414,7 @@ impl MdStore {
 #[async_trait::async_trait]
 impl StoreDriver for MdStore {
     fn name(&self) -> &str {
-        if self.use_tree {
+        if self.manager.is_tree() {
             "md-tree"
         } else {
             "md-plain"
@@ -419,20 +427,20 @@ impl StoreDriver for MdStore {
     }
 
     async fn exist(&self, oid: ObjectId, ec_index: u8) -> bool {
-        self.manager.obj_exists(oid, ec_index, self.use_tree).await
+        self.manager.obj_exists(oid, ec_index).await
     }
 
     async fn create_and_write(&self, oid: ObjectId, ec_index: u8, data: &[u8]) -> SdResult<()> {
-        if self.manager.obj_exists(oid, ec_index, self.use_tree).await {
+        if self.manager.obj_exists(oid, ec_index).await {
             return Err(SdError::OidExist);
         }
-        self.manager.write_obj(oid, ec_index, data, self.use_tree).await
+        self.manager.write_obj(oid, ec_index, data).await
     }
 
     async fn write(&self, oid: ObjectId, ec_index: u8, offset: u64, data: &[u8]) -> SdResult<()> {
         let path = self
             .manager
-            .get_obj_path(oid, ec_index, self.use_tree)
+            .get_obj_path(oid, ec_index)
             .await?;
         let data = data.to_vec();
 
@@ -449,16 +457,16 @@ impl StoreDriver for MdStore {
         length: usize,
     ) -> SdResult<Vec<u8>> {
         self.manager
-            .read_obj(oid, ec_index, offset, length, self.use_tree)
+            .read_obj(oid, ec_index, offset, length)
             .await
     }
 
     async fn remove(&self, oid: ObjectId, ec_index: u8) -> SdResult<()> {
-        self.manager.remove_obj(oid, ec_index, self.use_tree).await
+        self.manager.remove_obj(oid, ec_index).await
     }
 
     async fn get_obj_list(&self) -> SdResult<Vec<ObjectId>> {
-        self.manager.get_all_obj_list(self.use_tree).await
+        self.manager.get_all_obj_list().await
     }
 
     async fn flush(&self) -> SdResult<()> {
@@ -551,7 +559,7 @@ mod tests {
         let mgr = Arc::new(MdManager::new("plain"));
         mgr.add_disk(tmp.clone()).await.unwrap();
 
-        let store = MdStore::new(mgr, false);
+        let store = MdStore::new(mgr);
         let oid = ObjectId::new(0x0000_002a_0000_00ff);
 
         store.create_and_write(oid, 0, b"md-data").await.unwrap();

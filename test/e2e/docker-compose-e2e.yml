@@ -1,0 +1,148 @@
+# Docker Compose for sheepdog-rs E2E testing
+#
+# Usage:
+#   1. Build the image: docker compose -f test/e2e/docker-compose-e2e.yml build
+#   2. Start the cluster: COMPOSE_PROJECT_NAME=e2e docker compose -f test/e2e/docker-compose-e2e.yml up -d
+#   3. Format the cluster: COMPOSE_PROJECT_NAME=e2e docker compose -f test/e2e/docker-compose-e2e.yml exec admin /workspace/target/release/dog -a 172.24.0.2 -p 7000 cluster format --copies 1
+#   4. Run E2E tests: COMPOSE_PROJECT_NAME=e2e docker compose -f test/e2e/docker-compose-e2e.yml exec admin /workspace/target/release/sheepdog-e2e-test
+#   5. Stop the cluster: COMPOSE_PROJECT_NAME=e2e docker compose -f test/e2e/docker-compose-e2e.yml down
+#
+# Features:
+#   - HTTP/S3/Swift: enabled by default (feature flag `http` in Cargo.toml)
+#   - NBD: enabled via environment variable
+#   - NFS: enabled via environment variable
+#   - iSCSI: enabled via environment variable
+#
+# Ports (per node):
+#   Node 0: 7000 (cluster), 8000 (HTTP), 10809 (NBD), 2049 (NFS), 2050 (NFS mount), 3260 (iSCSI)
+#   Node 1: 7002 (cluster), 8002 (HTTP)
+#   Node 2: 7004 (cluster), 8004 (HTTP)
+#
+# Environment variables:
+#   ENABLE_NBD - Enable NBD export (default: true)
+#   ENABLE_NFS - Enable NFS export (default: true)
+#   ENABLE_ISCSI - Enable iSCSI export (default: false)
+
+services:
+  build:
+    build:
+      context: ../..
+      dockerfile: test.Dockerfile
+    image: sheepdog-rs-e2e:latest
+
+  node0:
+    image: sheepdog-rs-e2e:latest
+    container_name: sheepdog-e2e-node-0
+    hostname: node0
+    build:
+      context: ../..
+      dockerfile: test.Dockerfile
+    entrypoint: ["/workspace/start-node0.sh"]
+    ports:
+      - "7000:7000"
+      - "8000:8000"
+      - "10809:10809"
+      - "2049:2049"
+      - "2050:2050"
+      - "3260:3260"
+    volumes:
+      - node0-data:/tmp/sheepdog-cluster/node0
+      - ./node0-logs:/tmp/sheepdog-cluster/logs
+    environment:
+      - BIND_ADDRESS=172.25.0.2
+      - ENABLE_NBD=${ENABLE_NBD:-true}
+      - ENABLE_NFS=${ENABLE_NFS:-true}
+      - ENABLE_ISCSI=${ENABLE_ISCSI:-false}
+      - NBD_PORT=10809
+      - NFS_PORT=2049
+      - NFS_MOUNT_PORT=2050
+    networks:
+      sheepdog-net:
+        ipv4_address: 172.25.0.2
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 172.25.0.2 7000 || exit 1"]
+      interval: 2s
+      timeout: 10s
+  node1:
+    image: sheepdog-rs-e2e:latest
+    container_name: sheepdog-e2e-node-1
+    depends_on:
+      node0:
+        condition: service_healthy
+    entrypoint: ["/workspace/start-node.sh"]
+    ports:
+      - "7002:7002"
+      - "8002:8002"
+    volumes:
+      - node1-data:/tmp/sheepdog-cluster/node1
+      - ./node1-logs:/tmp/sheepdog-cluster/logs
+    environment:
+      - BIND_ADDRESS=172.25.0.3
+      - PORT=7002
+      - HTTP_PORT=8002
+      - SEED=172.25.0.2:7000
+      - NODE_NUM=1
+    healthcheck:
+      test: [ "CMD-SHELL", "nc -z 172.25.0.3 7002 || exit 1" ]
+      interval: 2s
+      timeout: 10s
+    networks:
+      sheepdog-net:
+        ipv4_address: 172.25.0.3
+
+  node2:
+    image: sheepdog-rs-e2e:latest
+    container_name: sheepdog-e2e-node-2
+    depends_on:
+      node0:
+        condition: service_healthy
+    entrypoint: ["/workspace/start-node.sh"]
+    ports:
+      - "7004:7004"
+      - "8004:8004"
+    volumes:
+      - node2-data:/tmp/sheepdog-cluster/node2
+      - ./node2-logs:/tmp/sheepdog-cluster/logs
+    environment:
+      - BIND_ADDRESS=172.25.0.4
+      - PORT=7004
+      - HTTP_PORT=8004
+      - SEED=172.25.0.2:7000
+      - NODE_NUM=2
+    healthcheck:
+      test: [ "CMD-SHELL", "nc -z 172.25.0.4 7004 || exit 1" ]
+      interval: 2s
+      timeout: 10s
+    networks:
+      sheepdog-net:
+        ipv4_address: 172.25.0.4
+
+  admin:
+    image: sheepdog-rs-e2e:latest
+    container_name: sheepdog-e2e-admin
+    depends_on:
+      node0:
+        condition: service_healthy
+      node1:
+        condition: service_started
+      node2:
+        condition: service_started
+    entrypoint: ["sleep", "infinity"]
+    networks:
+      sheepdog-net:
+        ipv4_address: 172.25.0.10
+
+networks:
+  sheepdog-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.25.0.0/24
+
+volumes:
+  node0-data:
+  node1-data:
+  node2-data:
+  node0-logs:
+  node1-logs:
+  node2-logs:

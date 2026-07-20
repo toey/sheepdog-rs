@@ -1,9 +1,10 @@
-//! Cluster configuration persistence.
+//! Cluster configuration persistence and iSCSI daemon configuration.
 //!
 //! Saves/loads cluster info and epoch logs to disk so that a restarting
 //! node can rejoin with the correct epoch.
-
 use std::path::Path;
+
+use serde::Deserialize;
 
 use sheepdog_proto::error::{SdError, SdResult};
 use sheepdog_proto::node::{ClusterInfo, EpochLog, SdNode};
@@ -67,6 +68,7 @@ pub async fn load_epoch_log(dir: &Path, epoch: u32) -> SdResult<EpochLog> {
 }
 
 /// Get the latest epoch number from disk.
+#[allow(dead_code)]
 pub async fn get_latest_epoch(dir: &Path) -> SdResult<u32> {
     let epoch_dir = dir.join("epoch");
     if !epoch_dir.exists() {
@@ -110,6 +112,7 @@ pub fn build_epoch_log(cinfo: &ClusterInfo) -> EpochLog {
 }
 
 /// Remove epoch logs for epochs strictly greater than the given epoch.
+#[allow(dead_code)]
 pub async fn remove_epoch_logs_after(dir: &Path, epoch: u32) -> SdResult<()> {
     let epoch_dir = dir.join("epoch");
     if !epoch_dir.exists() {
@@ -128,4 +131,135 @@ pub async fn remove_epoch_logs_after(dir: &Path, epoch: u32) -> SdResult<()> {
         }
     }
     Ok(())
+}
+
+// ================================================================
+// iSCSI Daemon Configuration
+// ================================================================
+
+/// Local deserializable auth config for TOML parsing.
+#[derive(Deserialize, Default, Clone, Debug)]
+#[cfg_attr(not(feature = "iscsi"), allow(dead_code))]
+pub struct IscsiAuthConfig {
+    #[serde(default)]
+    pub auth_type: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub secret: Option<String>,
+    #[serde(default)]
+    pub target_username: Option<String>,
+    #[serde(default)]
+    pub initiator_secret: Option<String>,
+}
+
+#[cfg(feature = "iscsi")]
+impl IscsiAuthConfig {
+    /// Convert to iscsi_target::AuthConfig.
+    pub fn to_auth_config(&self) -> iscsi_target::AuthConfig {
+        match self.auth_type.as_deref() {
+            Some("chap") => {
+                let username = self.username.as_deref().unwrap_or("default");
+                let secret = self.secret.as_deref().unwrap_or_default();
+                if secret.is_empty() {
+                    tracing::warn!("CHAP secret is empty for target, using empty string");
+                }
+                iscsi_target::AuthConfig::Chap {
+                    credentials: iscsi_target::ChapCredentials::new(username, secret),
+                }
+            },
+            Some("mutual_chap") => {
+                let target_username = self.target_username.as_deref().unwrap_or("default");
+                let target_secret = self.secret.as_deref().unwrap_or_default();
+                let initiator_username = self.username.as_deref().unwrap_or("initiator");
+                let initiator_secret = self.initiator_secret.as_deref().unwrap_or_default();
+
+                if target_secret.is_empty() || initiator_secret.is_empty() {
+                    tracing::warn!("Mutual CHAP: one or more secrets are empty");
+                }
+
+                iscsi_target::AuthConfig::MutualChap {
+                    target_credentials: iscsi_target::ChapCredentials::new(target_username, target_secret),
+                    initiator_credentials: iscsi_target::ChapCredentials::new(initiator_username, initiator_secret),
+                }
+            },
+            _ => iscsi_target::AuthConfig::None,
+        }
+    }
+}
+
+/// Full TOML config file format.
+#[derive(Deserialize, Default, Clone, Debug)]
+#[cfg_attr(not(feature = "iscsi"), allow(dead_code))]
+pub struct TomlConfig {
+    #[serde(default)]
+    pub iscsi: IscsiConfig,
+}
+
+/// iSCSI daemon configuration.
+#[derive(Deserialize, Default, Clone, Debug)]
+#[cfg_attr(not(feature = "iscsi"), allow(dead_code))]
+pub struct IscsiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_listen_address")]
+    pub listen_address: String,
+    #[serde(default)]
+    pub luns: Vec<LunConfig>,
+}
+
+fn default_listen_address() -> String {
+    "0.0.0.0:3260".to_string()
+}
+
+/// Per-LUN configuration (one LUN = one iSCSI target).
+#[derive(Deserialize, Default, Clone, Debug)]
+#[cfg_attr(not(feature = "iscsi"), allow(dead_code))]
+pub struct LunConfig {
+    #[serde(default)]
+    pub target_name: String,
+    #[serde(default)]
+    pub target_alias: Option<String>,
+    #[serde(default)]
+    pub lun: u16,
+    #[serde(default)]
+    pub vid: u32,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default = "default_block_size")]
+    pub block_size: u32,
+    #[serde(default)]
+    pub auth: IscsiAuthConfig,
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: u32,
+    #[serde(default)]
+    pub allowed_initiators: Option<Vec<String>>,
+}
+
+fn default_block_size() -> u32 {
+    512
+}
+
+fn default_max_connections() -> u32 {
+    16
+}
+
+fn default_max_sessions() -> u32 {
+    256
+}
+
+#[cfg(feature = "iscsi")]
+impl LunConfig {
+    /// Helper to create a CHAP-authenticated LUN config.
+    pub fn with_chap(mut self, username: impl Into<String>, secret: impl Into<String>) -> Self {
+        self.auth = IscsiAuthConfig {
+            auth_type: Some("chap".to_string()),
+            username: Some(username.into()),
+            secret: Some(secret.into()),
+            ..Default::default()
+        };
+        self
+    }
 }

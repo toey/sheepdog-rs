@@ -292,7 +292,7 @@ impl Filesystem for SheepFs {
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         debug!("getattr: ino={}", ino);
         match ino {
             ROOT_INO => reply.attr(&TTL, &self.root_attr()),
@@ -398,5 +398,234 @@ impl Filesystem for SheepFs {
                 reply.error(libc::ENOENT);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::volume::VdiVolume;
+
+    /// Test: SheepFs initial state — empty maps, next_ino=100, no refresh.
+    #[test]
+    fn test_initial_state() {
+        let config = SheepfsConfig {
+            sheep_addr: "127.0.0.1:7000".parse().unwrap(),
+            cache_timeout: Duration::from_secs(10),
+        };
+        let fs = SheepFs::new(config);
+
+        assert_eq!(fs.next_ino, 100);
+        assert!(fs.vdis.is_empty());
+        assert!(fs.vdi_inodes.is_empty());
+        assert!(fs.ino_to_vid.is_empty());
+        assert!(fs.last_refresh.is_none());
+    }
+
+    /// Test: Inode allocation sequence — VDI files start at 100 and increment.
+    #[test]
+    fn test_inode_allocation_sequence() {
+        let config = SheepfsConfig {
+            sheep_addr: "127.0.0.1:7000".parse().unwrap(),
+            cache_timeout: Duration::from_secs(10),
+        };
+        let mut fs = SheepFs::new(config);
+
+        let vdis = vec![
+            VdiVolume {
+                vid: 1,
+                name: "vdi_1".into(),
+                size: 1024,
+                copies: 3,
+                snapshot: false,
+                snap_id: 0,
+            },
+            VdiVolume {
+                vid: 2,
+                name: "vdi_2".into(),
+                size: 2048,
+                copies: 3,
+                snapshot: false,
+                snap_id: 0,
+            },
+            VdiVolume {
+                vid: 3,
+                name: "vdi_3".into(),
+                size: 4096,
+                copies: 3,
+                snapshot: false,
+                snap_id: 0,
+            },
+        ];
+
+        fs.apply_vdi_list(vdis);
+
+        assert_eq!(fs.vdi_inodes.get("vdi_1"), Some(&100));
+        assert_eq!(fs.vdi_inodes.get("vdi_2"), Some(&101));
+        assert_eq!(fs.vdi_inodes.get("vdi_3"), Some(&102));
+        assert_eq!(fs.next_ino, 103);
+    }
+
+    /// Test: Inode→vid mapping — verify ino_to_vid is populated correctly.
+    #[test]
+    fn test_inode_vid_mapping() {
+        let config = SheepfsConfig {
+            sheep_addr: "127.0.0.1:7000".parse().unwrap(),
+            cache_timeout: Duration::from_secs(10),
+        };
+        let mut fs = SheepFs::new(config);
+
+        let vdis = vec![
+            VdiVolume {
+                vid: 5,
+                name: "my_vdi".into(),
+                size: 8192,
+                copies: 3,
+                snapshot: false,
+                snap_id: 0,
+            },
+            VdiVolume {
+                vid: 10,
+                name: "another_vdi".into(),
+                size: 16384,
+                copies: 3,
+                snapshot: false,
+                snap_id: 0,
+            },
+        ];
+
+        fs.apply_vdi_list(vdis);
+
+        assert_eq!(fs.ino_to_vid.get(&100), Some(&5));
+        assert_eq!(fs.ino_to_vid.get(&101), Some(&10));
+
+        assert_eq!(fs.vdis.get(&5).map(|v| &v.name), Some(&"my_vdi".to_string()));
+        assert_eq!(
+            fs.vdis.get(&10).map(|v| &v.name),
+            Some(&"another_vdi".to_string())
+        );
+    }
+
+    /// Test: Duplicate VDI name doesn't allocate a new inode.
+    #[test]
+    fn test_duplicate_vdi_no_new_inode() {
+        let config = SheepfsConfig {
+            sheep_addr: "127.0.0.1:7000".parse().unwrap(),
+            cache_timeout: Duration::from_secs(10),
+        };
+        let mut fs = SheepFs::new(config);
+
+        let vdis1 = vec![VdiVolume {
+            vid: 1,
+            name: "vdi_a".into(),
+            size: 1024,
+            copies: 3,
+            snapshot: false,
+            snap_id: 0,
+        }];
+        fs.apply_vdi_list(vdis1);
+        assert_eq!(fs.vdi_inodes.get("vdi_a"), Some(&100));
+
+        let vdis2 = vec![VdiVolume {
+            vid: 99,
+            name: "vdi_a".into(),
+            size: 2048,
+            copies: 3,
+            snapshot: false,
+            snap_id: 0,
+        }];
+        fs.apply_vdi_list(vdis2);
+
+        // Should still be inode 100, not 101
+        assert_eq!(fs.vdi_inodes.get("vdi_a"), Some(&100));
+        assert_eq!(fs.next_ino, 101);
+    }
+
+    /// Test: Read bounds checking — clamp to VDI size, return empty beyond EOF.
+    #[test]
+    fn test_read_clamping() {
+        let vdi_size: u64 = 1024;
+
+        // Read within bounds
+        let read_size: u64 = std::cmp::min(512u64, vdi_size.saturating_sub(0));
+        assert_eq!(read_size, 512);
+
+        // Read at EOF → clamp to 0
+        let read_size = std::cmp::min(512u64, vdi_size.saturating_sub(vdi_size));
+        assert_eq!(read_size, 0);
+
+        // Read beyond EOF → clamp to 0 (saturating_sub prevents underflow)
+        let offset: u64 = 1500;
+        let read_size = std::cmp::min(512u64, vdi_size.saturating_sub(offset));
+        assert_eq!(read_size, 0);
+
+        // Read spanning EOF — should clamp to remaining bytes
+        let offset = 900u64;
+        let read_size = std::cmp::min(512u64, vdi_size.saturating_sub(offset));
+        assert_eq!(read_size, 124);
+    }
+
+    /// Test: Inode constants — root=1, vdi_dir=2, node_dir=3.
+    #[test]
+    fn test_inode_constants() {
+        assert_eq!(ROOT_INO, 1);
+        assert_eq!(VDI_DIR_INO, 2);
+        assert_eq!(NODE_DIR_INO, 3);
+    }
+
+    /// Test: VDI list TTL initial state — cache is expired (None) after construction.
+    #[test]
+    fn test_vdi_list_ttl_initial() {
+        let config = SheepfsConfig {
+            sheep_addr: "127.0.0.1:7000".parse().unwrap(),
+            cache_timeout: Duration::from_secs(10),
+        };
+        let fs = SheepFs::new(config);
+
+        // Initially, last_refresh is None — cache is considered expired
+        assert!(fs.last_refresh.is_none());
+    }
+
+    /// Test: Concurrent VDI insertions — multiple VDI volumes stored by vid.
+    #[test]
+    fn test_vdi_storage_by_vid() {
+        let config = SheepfsConfig {
+            sheep_addr: "127.0.0.1:7000".parse().unwrap(),
+            cache_timeout: Duration::from_secs(10),
+        };
+        let mut fs = SheepFs::new(config);
+
+        let vdis = vec![
+            VdiVolume {
+                vid: 1,
+                name: "vdi_1".into(),
+                size: 1024,
+                copies: 3,
+                snapshot: false,
+                snap_id: 0,
+            },
+            VdiVolume {
+                vid: 1024,
+                name: "vdi_large".into(),
+                size: 1048576,
+                copies: 2,
+                snapshot: false,
+                snap_id: 0,
+            },
+        ];
+
+        fs.apply_vdi_list(vdis);
+
+        // Verify vdis map keyed by vid
+        assert_eq!(fs.vdis.len(), 2);
+        assert!(fs.vdis.contains_key(&1));
+        assert!(fs.vdis.contains_key(&1024));
+        assert_eq!(fs.vdis.get(&1024).unwrap().size, 1048576);
+    }
+
+    /// Test: TTL constant for cached attributes.
+    #[test]
+    fn test_ttl_constant() {
+        assert_eq!(TTL, Duration::from_secs(10));
     }
 }

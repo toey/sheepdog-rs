@@ -1,6 +1,7 @@
 //! System-wide daemon state.
 //!
 //! In the C version this was a single global `struct system_info *sys`.
+#![allow(dead_code)]
 //! In Rust, we wrap it in `Arc<RwLock<>>` and pass explicitly.
 
 use std::collections::BTreeMap;
@@ -11,6 +12,7 @@ use std::sync::Arc;
 use bitvec::prelude::*;
 use tokio::sync::{Notify, RwLock};
 
+use crate::cluster::ClusterDriver;
 use sheepdog_proto::defaults::{
     DEFAULT_CACHE_SIZE_MB, DEFAULT_RECOVERY_MAX_EXEC_COUNT,
     DEFAULT_RECOVERY_QUEUE_WORK_INTERVAL_MS,
@@ -101,6 +103,19 @@ pub struct SystemInfo {
 
     /// Recovery tuning: whether throttling is active.
     pub recovery_throttling: bool,
+
+    /// Storage driver for local object I/O.
+    pub store: Arc<dyn crate::store::StoreDriver>,
+
+    /// Cluster driver for cluster-wide operations and notifications.
+    pub cluster_driver: Arc<dyn ClusterDriver>,
+
+    /// Multi-disk manager.
+    pub md_manager: Option<Arc<crate::store::md::MdManager>>,
+
+    /// iSCSI server instance for managing iSCSI targets.
+    #[cfg(feature = "iscsi")]
+    pub iscsi_server: Option<crate::iscsi::IscsiServer>,
 }
 
 impl SystemInfo {
@@ -109,6 +124,7 @@ impl SystemInfo {
         dir: PathBuf,
         this_node: SdNode,
         peer_transport: Arc<dyn PeerTransport>,
+        cluster_driver: Arc<dyn ClusterDriver>,
     ) -> Self {
         Self {
             cinfo: ClusterInfo::default(),
@@ -137,6 +153,11 @@ impl SystemInfo {
             recovery_max_exec_count: DEFAULT_RECOVERY_MAX_EXEC_COUNT,
             recovery_queue_work_interval: DEFAULT_RECOVERY_QUEUE_WORK_INTERVAL_MS,
             recovery_throttling: false,
+            store: Arc::new(crate::store::plain::PlainStore::new()),
+            md_manager: None,
+            cluster_driver,
+            #[cfg(feature = "iscsi")]
+            iscsi_server: None,
         }
     }
 

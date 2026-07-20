@@ -6,6 +6,8 @@
 //! The server implements ONC RPC (RFC 1831) framing over TCP for both
 //! the MOUNT program (program 100005, version 3) and the NFS program
 //! (program 100003, version 3).
+#![allow(dead_code)]
+#![allow(unused_variables)]
 
 pub mod handler;
 pub mod xdr;

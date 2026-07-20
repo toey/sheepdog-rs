@@ -1,0 +1,38 @@
+# Git
+.git
+.gitignore
+
+# Rust build artifacts
+target
+**/target/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.settings/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation
+README.md
+plans/
+
+# Build scripts and test scripts (not needed in image)
+scripts/
+peru.yaml
+
+# Kilo Code
+.kilocode/
+
+# LLm cache
+.llm/
+
+# Temporary files
+.tmp/

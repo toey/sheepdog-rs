@@ -1,6 +1,7 @@
 //! NFS filesystem abstraction layer.
 //!
 //! Maps NFS operations to sheepdog VDI data operations.
+#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 
@@ -86,6 +87,12 @@ impl NfsFilesystem {
     /// Get file attributes by inode number.
     pub fn getattr(&self, ino: u64) -> SdResult<&FileAttr> {
         self.attrs.get(&ino).ok_or(SdError::NoObj)
+    }
+
+    /// Set file attributes by inode number.
+    pub fn set_attr(&mut self, ino: u64, attr: FileAttr) -> SdResult<()> {
+        self.attrs.insert(ino, attr);
+        Ok(())
     }
 
     /// Lookup a name in a directory.

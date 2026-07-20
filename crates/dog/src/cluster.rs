@@ -45,6 +45,9 @@ pub enum ClusterCommands {
         /// Store backend name (default: use sheep's configured store)
         #[arg(short = 's', long, default_value = "")]
         store: String,
+        /// Force formatting even if cluster is already formatted
+        #[arg(long)]
+        force: bool,
     },
     /// Shutdown the entire cluster
     Shutdown,
@@ -107,8 +110,9 @@ pub async fn run(addr: &str, port: u16, args: ClusterArgs) {
             strict,
             disk_mode,
             store,
+            force,
         } => {
-            cluster_format(addr, port, copies, copy_policy, strict, disk_mode, &store).await;
+            cluster_format(addr, port, copies, copy_policy, strict, disk_mode, &store, force).await;
         }
         ClusterCommands::Shutdown => {
             cluster_shutdown(addr, port).await;
@@ -215,6 +219,7 @@ async fn cluster_format(
     strict: bool,
     disk_mode: bool,
     store: &str,
+    force: bool,
 ) {
     if copies == 0 {
         exit_error("Number of copies must be at least 1");
@@ -244,6 +249,7 @@ async fn cluster_format(
         copy_policy,
         flags,
         store: store.to_string(),
+        force,
     };
 
     match send_request_ok(&mut stream, req).await {

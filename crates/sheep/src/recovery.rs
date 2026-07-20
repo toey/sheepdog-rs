@@ -17,6 +17,7 @@
 //!
 //! If another epoch change occurs during recovery, the current recovery
 //! is aborted and restarted with the new epoch.
+#![allow(dead_code)]
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -89,7 +90,7 @@ impl RecoveryProgress {
 
 /// An object that needs to be recovered (fetched from a peer node).
 #[derive(Debug, Clone)]
-struct RecoveryItem {
+pub(crate) struct RecoveryItem {
     /// Object ID to recover.
     oid: ObjectId,
     /// EC index for erasure coding.

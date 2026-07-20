@@ -20,6 +20,8 @@ mod daemon;
 mod group;
 #[cfg(feature = "http")]
 mod http;
+#[cfg(feature = "iscsi")]
+mod iscsi;
 mod journal;
 mod migrate;
 mod nbd;
@@ -53,6 +55,7 @@ use sheepdog_core::transport::PeerTransport;
 
 use crate::cluster::{ClusterDriver, ClusterEvent};
 use crate::daemon::SystemInfo;
+use crate::store::StoreDriver;
 
 /// Sheepdog storage daemon
 #[derive(Parser, Debug)]
@@ -97,6 +100,10 @@ struct Args {
     /// Object cache size in MB
     #[arg(long, default_value_t = DEFAULT_CACHE_SIZE_MB)]
     cache_size: u64,
+
+    /// Multiple data directories for multi-disk storage (objects distributed across them)
+    #[arg(long = "md-disks", value_name = "DIR", value_delimiter = ',')]
+    md_disks: Vec<PathBuf>,
 
     /// Fault zone ID
     #[arg(short = 'z', long, default_value_t = 0)]
@@ -150,6 +157,18 @@ struct Args {
     /// Enable DPDK data plane acceleration for peer I/O
     #[arg(long)]
     dpdk: bool,
+
+    /// Enable iSCSI target server
+    #[arg(long)]
+    iscsi: bool,
+
+    /// iSCSI listen address (default: 0.0.0.0:3260)
+    #[arg(long, default_value = "0.0.0.0:3260")]
+    iscsi_addr: String,
+
+    /// Path to iSCSI TOML config file (optional, defaults to empty)
+    #[arg(short = 'c', long)]
+    config: Option<PathBuf>,
 
     /// DPDK EAL arguments (e.g. "-l 0-3 -n 4 --file-prefix sheep")
     #[arg(long, default_value = "")]
@@ -268,32 +287,6 @@ async fn main() {
         Arc::new(sheepdog_core::tcp_transport::TcpTransport::new(DEFAULT_TCP_MAX_CONNS_PER_NODE))
     };
 
-    // Build system info
-    let mut sys_info = SystemInfo::new(listen_addr, args.dir.clone(), this_node, peer_transport);
-    sys_info.gateway_mode = args.gateway;
-    sys_info.use_directio = args.directio;
-    sys_info.journal_dir = args.journal;
-    sys_info.journal_size = args.journal_size * 1024 * 1024;
-    sys_info.object_cache_enabled = args.cache;
-    sys_info.object_cache_size = args.cache_size;
-
-    // Try to load existing config (if rejoining)
-    match config::load_config(&args.dir).await {
-        Ok(cinfo) => {
-            info!("loaded existing config: epoch={}", cinfo.epoch);
-            sys_info.cinfo = cinfo;
-        }
-        Err(sheepdog_proto::error::SdError::NotFormatted) => {
-            info!("no existing config, starting fresh (waiting for format)");
-        }
-        Err(e) => {
-            error!("failed to load config: {}", e);
-            std::process::exit(1);
-        }
-    }
-
-    let sys = Arc::new(RwLock::new(sys_info));
-
     // ---------------------------------------------------------------
     // Create cluster driver
     // ---------------------------------------------------------------
@@ -346,6 +339,75 @@ async fn main() {
         }
     };
 
+    // Build system info
+    let mut sys_info = SystemInfo::new(listen_addr, args.dir.clone(), this_node, peer_transport, cluster_driver.clone());
+    sys_info.gateway_mode = args.gateway;
+    sys_info.use_directio = args.directio;
+    sys_info.journal_dir = args.journal;
+    sys_info.journal_size = args.journal_size * 1024 * 1024;
+    sys_info.object_cache_enabled = args.cache;
+    sys_info.object_cache_size = args.cache_size;
+    sys_info.md_disks = args.md_disks.clone();
+
+    // Build storage driver based on md_disks
+    let store: Arc<dyn store::StoreDriver>;
+    let md_manager: Option<Arc<store::md::MdManager>>;
+
+    if !args.md_disks.is_empty() {
+        info!(
+            "multi-disk storage enabled with {} disk(s)",
+            args.md_disks.len()
+        );
+        let md_manager_inner = Arc::new(store::md::MdManager::new("plain"));
+        for disk_path in &args.md_disks {
+            if let Err(e) = md_manager_inner.add_disk(disk_path.clone()).await {
+                error!("failed to add md disk {}: {}", disk_path.display(), e);
+                std::process::exit(1);
+            }
+        }
+        let md_store = store::md::MdStore::new(md_manager_inner.clone());
+        if let Err(e) = md_store.init(&args.dir, false).await {
+            error!("failed to initialize md store: {}", e);
+            std::process::exit(1);
+        }
+        store = Arc::new(md_store);
+        md_manager = Some(md_manager_inner);
+    } else {
+        store = Arc::new(store::plain::PlainStore::new());
+        md_manager = None;
+        // Initialize the plain store so get_obj_list() doesn't fail with NoStore
+        if let Err(e) = store.init(&args.dir, false).await {
+            error!("failed to initialize plain store: {}", e);
+            std::process::exit(1);
+        }
+    }
+    sys_info.store = store;
+    sys_info.md_manager = md_manager;
+    
+    #[cfg(feature = "iscsi")]
+    {
+        sys_info.iscsi_server = None;
+    }
+
+    // Try to load existing config (if rejoining)
+    match config::load_config(&args.dir).await {
+        Ok(cinfo) => {
+            info!("loaded existing config: epoch={}", cinfo.epoch);
+            sys_info.cinfo = cinfo;
+        }
+        Err(sheepdog_proto::error::SdError::NotFormatted) => {
+            info!("no existing config, starting fresh (waiting for format)");
+        }
+        Err(e) => {
+            error!("failed to load config: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    // Clone the store before moving sys_info into sys
+    let recovery_store = sys_info.store.clone();
+    let sys = Arc::new(RwLock::new(sys_info));
+
     // Initialize and join the cluster via the driver
     {
         let s = sys.read().await;
@@ -376,16 +438,7 @@ async fn main() {
     // Spawn recovery worker
     // ---------------------------------------------------------------
     if !args.gateway {
-        let recovery_store: Arc<dyn store::StoreDriver> =
-            Arc::new(store::plain::PlainStore::new());
-        // Try to init with existing layout; fall back to first-time init
-        if recovery_store.init(&args.dir, false).await.is_err() {
-            if let Err(e) = recovery_store.init(&args.dir, true).await {
-                error!("failed to init store for recovery: {}", e);
-                std::process::exit(1);
-            }
-        }
-
+        // Use the configured store (plain, tree, or md) for recovery
         let recovery_shutdown = {
             let s = sys.read().await;
             s.shutdown_notify.clone()
@@ -399,6 +452,74 @@ async fn main() {
     }
 
     info!("sheep ready on {}", listen_addr);
+
+    // ---------------------------------------------------------------
+    // Capture tokio runtime handle before spawning servers
+    // ---------------------------------------------------------------
+    #[cfg(feature = "iscsi")]
+    let handle = tokio::runtime::Handle::current();
+    #[cfg(not(feature = "iscsi"))]
+    let _handle = tokio::runtime::Handle::current();
+
+    // ---------------------------------------------------------------
+    // Start optional iSCSI server
+    // ---------------------------------------------------------------
+    // Load config to get iSCSI settings (optional TOML file)
+    #[cfg(feature = "iscsi")]
+    let toml_config = match &args.config {
+        Some(path) => {
+            let config_path: std::path::PathBuf = if path.is_absolute() {
+                path.clone()
+            } else {
+                args.dir.join(path)
+            };
+            match std::fs::read_to_string(&config_path) {
+                Ok(content) => toml::from_str(&content).unwrap_or_default(),
+                Err(e) => {
+                    warn!("failed to read TOML config at {}: {}", config_path.display(), e);
+                    crate::config::TomlConfig::default()
+                }
+            }
+        }
+        None => crate::config::TomlConfig::default(),
+    };
+    #[cfg(not(feature = "iscsi"))]
+    let _toml_config = crate::config::TomlConfig::default();
+    
+    #[cfg(feature = "iscsi")]
+    let iscsi_config = crate::config::IscsiConfig {
+        enabled: args.iscsi || toml_config.iscsi.enabled,
+        listen_address: if args.iscsi_addr != "0.0.0.0:3260" {
+            args.iscsi_addr.clone()
+        } else {
+            toml_config.iscsi.listen_address.clone()
+        },
+        luns: if args.iscsi && toml_config.iscsi.luns.is_empty() {
+            // CLI override: single LUN for VID 0 when --iscsi is passed but no TOML LUNs
+            vec![crate::config::LunConfig {
+                target_name: "iqn.2024-06.com.sheepdog:volume".to_string(),
+                vid: 0,
+                size: 0,
+                ..Default::default()
+            }]
+        } else {
+            toml_config.iscsi.luns.clone()
+        },
+    };
+    #[cfg(not(feature = "iscsi"))]
+    let _iscsi_config = crate::config::IscsiConfig::default();
+    #[cfg(feature = "iscsi")]
+    if iscsi_config.enabled && !iscsi_config.luns.is_empty() {
+        match crate::iscsi::start_iscsi_server(sys.clone(), iscsi_config, handle.clone()) {
+            Ok(server) => {
+                info!("iSCSI server started successfully");
+                sys.write().await.iscsi_server = Some(server);
+            }
+            Err(e) => {
+                error!("iSCSI server failed to start: {}", e);
+            }
+        }
+    }
 
     // Spawn the main services
     let sys_accept = sys.clone();
@@ -468,6 +589,16 @@ async fn main() {
     // Leave the cluster gracefully
     if let Err(e) = cluster_driver.leave().await {
         warn!("cluster leave failed: {}", e);
+    }
+
+    // Shut down the iSCSI server (blocking — runs on OS threads)
+    #[cfg(feature = "iscsi")]
+    {
+        let mut s = sys.write().await;
+        if let Some(ref mut srv) = s.iscsi_server {
+            info!("Shutting down iSCSI server...");
+            srv.shutdown_all();
+        }
     }
 
     {

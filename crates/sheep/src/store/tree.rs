@@ -1,6 +1,7 @@
 //! Hierarchical (tree) storage backend.
 //!
 //! Stores objects in a 2-level directory hierarchy:
+#![allow(dead_code)]
 //!   `{base}/obj/{vid:06x}/{oid:016x}`
 //!
 //! Objects are grouped by their VDI ID into subdirectories, which provides

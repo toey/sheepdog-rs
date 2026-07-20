@@ -90,6 +90,7 @@ pub enum SdRequest {
         copy_policy: u8,
         flags: u16,
         store: String,
+        force: bool,
     },
     Shutdown,
     StatSheep,
@@ -251,6 +252,21 @@ pub enum SdRequest {
         name: String,
     },
 
+    // ---- iSCSI operations ----
+    IscsiCreate {
+        target_name: String,
+        target_alias: Option<String>,
+        vid: u32,
+        size: u64,
+        block_size: u32,
+        chap_username: Option<String>,
+        chap_secret: Option<String>,
+    },
+    IscsiList,
+    IscsiDelete {
+        target_name: String,
+    },
+
     // ---- Forwarding ----
     ForwardObj {
         oid: ObjectId,
@@ -270,6 +286,17 @@ pub struct SdResponse {
     pub id: u32,
     /// Response result
     pub result: ResponseResult,
+}
+
+/// iSCSI target info for list responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IscsiTargetInfo {
+    pub target_name: String,
+    pub target_alias: Option<String>,
+    pub vid: u32,
+    pub size: u64,
+    pub block_size: u32,
+    pub chap_enabled: bool,
 }
 
 /// Response payload variants.
@@ -304,6 +331,8 @@ pub enum ResponseResult {
     },
     /// Node list
     NodeList(Vec<SdNode>),
+    /// iSCSI targets list
+    IscsiList(Vec<IscsiTargetInfo>),
 }
 
 impl SdResponse {

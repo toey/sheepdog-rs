@@ -4,6 +4,7 @@
 //! In the C version, this was `vdi.c` (~1,800 lines). We simplify
 //! significantly by using Rust's BTreeMap instead of manual hash tables
 //! and by leveraging the type system for lock states.
+#![allow(dead_code)]
 
 use sheepdog_proto::constants::SD_NR_VDIS;
 use sheepdog_proto::defaults::DEFAULT_MAX_VDI_HASH_RETRIES;

@@ -6,6 +6,7 @@
 //!
 //! In Rust we use tokio tasks instead of epoll + work queues:
 //!   accept_loop → spawn(handle_client) → read_request → dispatch → respond
+#![allow(dead_code)]
 
 use sheepdog_proto::error::{SdError, SdResult};
 use sheepdog_proto::request::{RequestHeader, SdRequest, SdResponse, ResponseResult};
@@ -162,10 +163,14 @@ pub(crate) async fn dispatch(sys: SharedSys, request: Request) -> SdResponse {
         let s = sys.read().await;
         match s.cinfo.status {
             sheepdog_proto::node::ClusterStatus::Killed => {
-                return SdResponse::error(proto_ver, epoch, id, SdError::Killed);
+                if !is_force_op(&request.req) {
+                    return SdResponse::error(proto_ver, epoch, id, SdError::Killed);
+                }
             }
             sheepdog_proto::node::ClusterStatus::Shutdown => {
-                return SdResponse::error(proto_ver, epoch, id, SdError::Shutdown);
+                if !is_force_op(&request.req) {
+                    return SdResponse::error(proto_ver, epoch, id, SdError::Shutdown);
+                }
             }
             sheepdog_proto::node::ClusterStatus::WaitForFormat => {
                 if !is_force_op(&request.req) {
